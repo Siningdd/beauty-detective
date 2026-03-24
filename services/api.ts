@@ -20,8 +20,11 @@ export async function analyzeImage(
   signal?: AbortSignal,
   categoryHint?: "skincare" | "supplement" | "haircare",
   thinkingHint?: ThinkingHint,
-  ingredientText?: string
+  ingredientText?: string,
+  userQuestion?: string
 ): Promise<AnalysisResult> {
+  const q =
+    typeof userQuestion === "string" ? userQuestion.trim() : "";
   const res = await fetch(`${API_BASE}/api/analyze`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -31,6 +34,7 @@ export async function analyzeImage(
       ...(categoryHint && { categoryHint }),
       ...(thinkingHint && { thinkingHint }),
       ...(ingredientText && { ingredientText }),
+      ...(q.length > 0 && { userQuestion: q }),
     }),
     signal,
   });

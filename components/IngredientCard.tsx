@@ -35,6 +35,8 @@ interface IngredientCardProps {
   isLast?: boolean;
   /** When list is grouped by feature_tag, hide the duplicate tag pill */
   hideFeatureTagBadge?: boolean;
+  /** When false, safety badge shows a placeholder (paywall) */
+  showSafetyScore?: boolean;
 }
 
 export function IngredientCard({
@@ -45,6 +47,7 @@ export function IngredientCard({
   safetyScore: aiSafety,
   isLast,
   hideFeatureTagBadge,
+  showSafetyScore = true,
 }: IngredientCardProps) {
   const dictEntry = lookupIngredient(name);
   const omitActions = NO_ACTIONS_TAGS.has(feature_tag);
@@ -55,7 +58,9 @@ export function IngredientCard({
     typeof aiSafety === "number"
       ? aiSafety
       : (dictEntry?.safetyScore ?? FALLBACK_SAFETY);
-  const sb = safetyBadgeStyle(safetyScore);
+  const sb = showSafetyScore
+    ? safetyBadgeStyle(safetyScore)
+    : { bg: "rgba(148, 163, 184, 0.2)", text: TEXT_SECONDARY };
 
   return (
     <View style={[styles.row, isLast && styles.rowLast]}>
@@ -84,7 +89,7 @@ export function IngredientCard({
           </View>
           <View style={[styles.safetyBadge, { backgroundColor: sb.bg }]}>
             <Text style={[styles.safetyText, { color: sb.text }]}>
-              Safety: {safetyScore}
+              Safety: {showSafetyScore ? safetyScore : "—"}
             </Text>
           </View>
         </View>

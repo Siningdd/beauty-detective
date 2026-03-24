@@ -5,6 +5,7 @@ import {
   StyleSheet,
   Pressable,
   Image,
+  Modal,
 } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { Ionicons } from "@expo/vector-icons";
@@ -12,16 +13,14 @@ import { useRouter } from "expo-router";
 import {
   getPendingImage,
   clearPendingImage,
-  setReport,
-  setLastAnalyzedImage,
+  setPendingImage,
+  setAnalysisParams,
 } from "../services/store";
-import { analyzeImage } from "../services/api";
 import {
-  extractCorrectedIngredientText,
-  guessThinkingHint,
+  detectOcrAndHints,
+  resolveHintDecision,
 } from "../services/ocrDetect";
 import { LoadingScreen } from "../components/LoadingScreen";
-import type { AnalysisResult } from "../types/analysis";
 import {
   BG,
   BUTTON_GRADIENT,
@@ -34,6 +33,8 @@ import {
 export default function PreviewScreen() {
   const router = useRouter();
   const controllerRef = useRef(new AbortController());
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const didNavigateRef = useRef(false);
   const [pending, setPending] = useState<{
     uri: string;
     base64: string;
@@ -41,18 +42,53 @@ export default function PreviewScreen() {
     ingredientText?: string;
   } | null>(null);
   const [loading, setLoading] = useState(false);
-  const [showResult, setShowResult] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [unknownIngredientText, setUnknownIngredientText] = useState<string | null>(
+    null
+  );
 
   useEffect(() => {
     setPending(getPendingImage());
   }, []);
 
+  const clearJumpTimer = () => {
+    if (!timerRef.current) return;
+    clearTimeout(timerRef.current);
+    timerRef.current = null;
+  };
+
+  const jumpToReport = () => {
+    if (didNavigateRef.current) return;
+    didNavigateRef.current = true;
+    clearJumpTimer();
+    router.replace("/report");
+  };
+
   const handleBack = () => {
     controllerRef.current.abort();
+    clearJumpTimer();
+    didNavigateRef.current = false;
+    setUnknownIngredientText(null);
     setLoading(false);
     clearPendingImage();
     router.back();
+  };
+
+  const submitManualCategory = (options: {
+    categoryHint: "skincare" | "supplement" | "haircare";
+    thinkingHint?: "supplement" | "essence" | "cream";
+  }) => {
+    if (!pending || !unknownIngredientText) return;
+    setAnalysisParams({
+      base64: pending.base64,
+      mimeType: pending.mimeType,
+      categoryHint: options.categoryHint,
+      thinkingHint: options.thinkingHint,
+      ingredientText: unknownIngredientText,
+    });
+    setUnknownIngredientText(null);
+    setLoading(true);
+    jumpToReport();
   };
 
   const handleConfirm = async () => {
@@ -60,52 +96,72 @@ export default function PreviewScreen() {
     controllerRef.current.abort();
     controllerRef.current = new AbortController();
     const { signal } = controllerRef.current;
+    clearJumpTimer();
+    didNavigateRef.current = false;
 
     setError(null);
     setLoading(true);
-    setShowResult(false);
+    // Always hand off the minimal payload so report can continue immediately.
+    setPendingImage({
+      uri: pending.uri,
+      base64: pending.base64,
+      mimeType: pending.mimeType,
+    });
+    setAnalysisParams({
+      base64: pending.base64,
+      mimeType: pending.mimeType,
+    });
+    timerRef.current = setTimeout(() => {
+      if (signal.aborted) return;
+      jumpToReport();
+    }, 1500);
     try {
-      const hintResult = await guessThinkingHint({
+      const detected = await detectOcrAndHints({
         uri: pending.uri,
         base64: pending.base64,
       });
-      const corrected = await extractCorrectedIngredientText({
-        uri: pending.uri,
-        base64: pending.base64,
+      const ingredientText = detected.correctedText || detected.rawOcrText;
+      const resolved = resolveHintDecision({
+        confidenceHint: detected.confidenceHint,
+        categoryHint: detected.categoryHint,
+        thinkingHint: detected.thinkingHint,
       });
-      const ingredientText = corrected.correctedText || hintResult.ocrText;
-      const shouldPassHint = corrected.confidenceHint !== "low";
-
-      const report = (await analyzeImage(
-        pending.base64,
-        pending.mimeType,
-        signal,
-        shouldPassHint ? hintResult.categoryHint : undefined,
-        shouldPassHint ? hintResult.thinkingHint : undefined,
-        ingredientText
-      )) as AnalysisResult;
-
-      setReport(report);
-      setLastAnalyzedImage({
+      setPendingImage({
         uri: pending.uri,
         base64: pending.base64,
         mimeType: pending.mimeType,
         ingredientText,
       });
-      if (report.category !== "unknown") {
-        clearPendingImage();
+      if (!resolved) {
+        if (signal.aborted || didNavigateRef.current) return;
+        clearJumpTimer();
+        setLoading(false);
+        setUnknownIngredientText(ingredientText || "");
+        return;
       }
-      setLoading(false);
-      setShowResult(true);
+      setAnalysisParams({
+        base64: pending.base64,
+        mimeType: pending.mimeType,
+        categoryHint: resolved.categoryHint,
+        thinkingHint: resolved.thinkingHint,
+        ingredientText,
+      });
+      if (signal.aborted) return;
+      jumpToReport();
     } catch (e) {
       if (e instanceof Error && e.name === "AbortError") return;
+      clearJumpTimer();
+      didNavigateRef.current = false;
       setError(e instanceof Error ? e.message : "Analysis failed");
       setLoading(false);
     }
   };
 
   useEffect(() => {
-    return () => controllerRef.current.abort();
+    return () => {
+      controllerRef.current.abort();
+      clearJumpTimer();
+    };
   }, []);
 
   if (!pending) {
@@ -121,19 +177,10 @@ export default function PreviewScreen() {
     );
   }
 
-  if (loading || showResult) {
+  if (loading) {
     return (
       <View style={[styles.container, { backgroundColor: BG }]}>
         <LoadingScreen
-          gotResult={showResult}
-          onFadeComplete={
-            showResult
-              ? () => {
-                  setShowResult(false);
-                  router.replace("/report");
-                }
-              : undefined
-          }
           onCancel={loading ? handleBack : undefined}
         />
       </View>
@@ -176,6 +223,63 @@ export default function PreviewScreen() {
 
         {error && <Text style={styles.error}>{error}</Text>}
       </View>
+      <Modal visible={!!unknownIngredientText} transparent animationType="fade">
+        <View style={styles.selectorOverlay}>
+          <View style={styles.selectorCard}>
+            <Text style={styles.selectorTitle}>Unknown product type</Text>
+            <Text style={styles.selectorHint}>
+              OCR cannot confidently classify this image. Choose a category to continue.
+            </Text>
+            <View style={styles.selectorActions}>
+              <Pressable
+                style={styles.selectorButton}
+                onPress={() =>
+                  submitManualCategory({
+                    categoryHint: "supplement",
+                    thinkingHint: "supplement",
+                  })
+                }
+              >
+                <Text style={styles.selectorButtonText}>Supplement</Text>
+              </Pressable>
+              <Pressable
+                style={styles.selectorButton}
+                onPress={() =>
+                  submitManualCategory({
+                    categoryHint: "skincare",
+                    thinkingHint: "essence",
+                  })
+                }
+              >
+                <Text style={styles.selectorButtonText}>Skincare (Essence)</Text>
+              </Pressable>
+              <Pressable
+                style={styles.selectorButton}
+                onPress={() =>
+                  submitManualCategory({
+                    categoryHint: "skincare",
+                    thinkingHint: "cream",
+                  })
+                }
+              >
+                <Text style={styles.selectorButtonText}>Skincare (Cream)</Text>
+              </Pressable>
+              <Pressable
+                style={styles.selectorButton}
+                onPress={() => submitManualCategory({ categoryHint: "haircare" })}
+              >
+                <Text style={styles.selectorButtonText}>Haircare</Text>
+              </Pressable>
+              <Pressable
+                style={styles.selectorCancel}
+                onPress={() => setUnknownIngredientText(null)}
+              >
+                <Text style={styles.selectorCancelText}>Cancel</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -262,5 +366,56 @@ const styles = StyleSheet.create({
     marginTop: 16,
     fontSize: 14,
     textAlign: "center",
+  },
+  selectorOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(2, 6, 23, 0.55)",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 20,
+  },
+  selectorCard: {
+    width: "100%",
+    maxWidth: 420,
+    backgroundColor: CARD_BG,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: THEME_BORDER,
+    padding: 16,
+  },
+  selectorTitle: {
+    color: TEXT_PRIMARY,
+    fontSize: 16,
+    fontWeight: "700",
+  },
+  selectorHint: {
+    color: TEXT_MUTED,
+    fontSize: 13,
+    lineHeight: 19,
+    marginTop: 8,
+  },
+  selectorActions: {
+    marginTop: 14,
+    gap: 10,
+  },
+  selectorButton: {
+    paddingVertical: 11,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: THEME_BORDER,
+    alignItems: "center",
+  },
+  selectorButtonText: {
+    color: TEXT_PRIMARY,
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  selectorCancel: {
+    alignItems: "center",
+    paddingVertical: 6,
+  },
+  selectorCancelText: {
+    color: TEXT_MUTED,
+    fontSize: 13,
   },
 });

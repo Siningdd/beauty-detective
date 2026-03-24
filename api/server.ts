@@ -24,6 +24,7 @@ app.post("/api/analyze", async (req, res) => {
       mimeType = "image/jpeg",
       categoryHint,
       thinkingHint,
+      userQuestion,
     } = req.body;
 
     if (!image) {
@@ -50,7 +51,8 @@ app.post("/api/analyze", async (req, res) => {
       mimeType,
       validCategory,
       validThinking,
-      ingredientText
+      ingredientText,
+      typeof userQuestion === "string" ? userQuestion : undefined
     );
     res.json(result);
   } catch (err) {

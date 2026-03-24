@@ -47,7 +47,17 @@ const NO_ACTIONS_TAGS = new Set<string>([
   "Flavor/Fragrance",
 ]);
 
-const IMAGE_MODEL = "gemini-2.5-flash";
+const IMAGE_MODEL = "gemini-2.0-flash-lite-001";
+
+/** Shared generation defaults (maps to REST generationConfig). */
+const DEFAULT_GENERATE_CONTENT_CONFIG = {
+  temperature: 0.2,
+  /** Large ingredient JSON can exceed 2k tokens; truncation causes JSON.parse failures. */
+  maxOutputTokens: 8192,
+  responseMimeType: "application/json",
+} as const;
+
+const ENABLE_PROMPT_CACHE = false;
 
 const CONTEXT_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 const CONTEXT_CACHE_TTL = "86400s";
@@ -643,11 +653,43 @@ function normalizeCoreTagItems(raw: unknown, category: AnalysisResult["category"
   return out;
 }
 
+/** First top-level `{ ... }` in `s`, respecting strings (avoids greedy `\{[\s\S]*\}` breaking on nested objects). */
+function extractFirstBalancedJsonObject(s: string): string | null {
+  const start = s.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (inString) {
+      if (escape) {
+        escape = false;
+      } else if (c === "\\") {
+        escape = true;
+      } else if (c === '"') {
+        inString = false;
+      }
+    } else {
+      if (c === '"') {
+        inString = true;
+      } else if (c === "{") {
+        depth++;
+      } else if (c === "}") {
+        depth--;
+        if (depth === 0) return s.slice(start, i + 1);
+      }
+    }
+  }
+  return null;
+}
+
 function parseJsonObject(text: string): Record<string, unknown> {
-  const codeBlockMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const trimmed = text.trim();
+  const codeBlockMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
   const jsonStr = codeBlockMatch
     ? codeBlockMatch[1].trim()
-    : text.match(/\{[\s\S]*\}/)?.[0] ?? text;
+    : extractFirstBalancedJsonObject(trimmed) ?? trimmed;
   return JSON.parse(jsonStr) as Record<string, unknown>;
 }
 
@@ -876,6 +918,7 @@ function normalizeToNewFormat(raw: Record<string, unknown>): AnalysisResult {
     conflicts,
     suitability,
     tips,
+    expert_advice: tips,
   };
 }
 
@@ -1098,6 +1141,7 @@ function normalizeProductSlimToAnalysisResult(
     conflicts,
     suitability,
     tips,
+    expert_advice: tips,
   };
 }
 
@@ -1149,7 +1193,8 @@ export async function analyzeCosmeticImage(
   mimeType: string = "image/jpeg",
   categoryHint?: CategoryHintInput,
   thinkingHint?: ThinkingHint,
-  ingredientText?: string
+  ingredientText?: string,
+  userQuestion?: string
 ): Promise<AnalysisResult> {
   if (!GEMINI_API_KEY) {
     throw new Error("请在 .env 中配置 GEMINI_API_KEY 或 GOOGLE_API_KEY");
@@ -1159,22 +1204,31 @@ export async function analyzeCosmeticImage(
   const useThinking = shouldEnableThinking(categoryHint, thinkingHint);
 
   const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-  const cache = await getOrCreateCache(ai, "analysis");
+  const cache = ENABLE_PROMPT_CACHE ? await getOrCreateCache(ai, "analysis") : null;
   const fullPrompt = getAnalysisPrompt(normalizedCategoryHint);
   const suffix = getPromptSuffix(ANALYSIS_SYSTEM_INSTRUCTION_BASE, fullPrompt);
   const normalizedIngredientText =
     typeof ingredientText === "string" ? ingredientText.trim() : "";
   const hasIngredientText = normalizedIngredientText.length >= 12;
-  // cached system instruction already contains the heavy ~2500 tokens.
-  // Per request, only send the category-specific prompt suffix.
+  const normalizedUserQuestion =
+    typeof userQuestion === "string" ? userQuestion.trim() : "";
+  const hasUserQuestion = normalizedUserQuestion.length > 0;
+  // Cache ON: send only category suffix (system prompt lives in cachedContent).
+  // Cache OFF: send full prompt so all rules remain effective.
+  const promptForRequest = cache
+    ? suffix || "Analyze the provided product image and output strict JSON."
+    : fullPrompt;
   const userText =
-    (suffix || "Analyze the provided product image and output strict JSON.") +
+    promptForRequest +
     (hasIngredientText
       ? "\n\nINPUT_INGREDIENT_TEXT=" + JSON.stringify(normalizedIngredientText)
+      : "") +
+    (hasUserQuestion
+      ? "\n\nuserQuestion=" + JSON.stringify(normalizedUserQuestion)
       : "");
 
   const response = await ai.models.generateContent({
-    model: IMAGE_MODEL,
+    model: "gemini-2.5-flash",
     contents: [
       {
         inlineData: {
@@ -1185,13 +1239,13 @@ export async function analyzeCosmeticImage(
       { text: userText },
     ],
     config: {
-      responseMimeType: "application/json",
+      ...DEFAULT_GENERATE_CONTENT_CONFIG,
       responseJsonSchema: getAnalysisResponseSchema(normalizedCategoryHint),
       thinkingConfig: {
         thinkingBudget: useThinking ? 1400: 0,
         includeThoughts: useThinking,
       },
-      cachedContent: cache.name,
+      ...(cache ? { cachedContent: cache.name } : {}),
     },
   });
 
@@ -1203,7 +1257,7 @@ export async function analyzeCosmeticImage(
         )
       : meta;
   console.log(
-    `\n[Thinking: ${useThinking ? "ON" : "OFF"} | categoryHint: ${categoryHint ?? "无"} | thinkingHint: ${thinkingHint ?? "无"} | ocrText: ${hasIngredientText ? "YES" : "NO"}] Gemini usageMetadata:`,
+    `\n[Thinking: ${useThinking ? "ON" : "OFF"} | categoryHint: ${categoryHint ?? "无"} | thinkingHint: ${thinkingHint ?? "无"} | ocrText: ${hasIngredientText ? "YES" : "NO"} | userQuestion: ${hasUserQuestion ? "YES" : "NO"}] Gemini usageMetadata:`,
     JSON.stringify(plain ?? {}, null, 2)
   );
 
@@ -1245,7 +1299,7 @@ export async function analyzeCosmeticText(
       },
     ],
     config: {
-      responseMimeType: "application/json",
+      ...DEFAULT_GENERATE_CONTENT_CONFIG,
       responseJsonSchema: getAnalysisResponseSchema(normalizedCategoryHint),
       thinkingConfig: {
         thinkingBudget: useThinking ? 1400 : 0,

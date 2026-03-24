@@ -11,34 +11,83 @@ export type ThinkingHint = "supplement" | "essence" | "cream" | "special";
 
 export type CategoryHint = "skincare" | "haircare" | "supplement";
 export type OcrConfidenceHint = "low" | "medium" | "high";
+export type ResolvedHintDecision = {
+  categoryHint: CategoryHint;
+  thinkingHint?: Exclude<ThinkingHint, "special">;
+};
+export type OcrDetectionResult = {
+  rawOcrText: string;
+  correctedText: string;
+  confidenceHint: OcrConfidenceHint;
+  categoryHint?: CategoryHint;
+  thinkingHint?: ThinkingHint;
+  ocrText: string;
+};
+type ClassifyKind =
+  | "supplement"
+  | "shampoo"
+  | "skincare_serum"
+  | "skincare_cream"
+  | "unknown";
 
-// 补剂成分：去除易与护肤重叠的词（如 ascorbic/ascorbate）以降低误判。
-const SUPPLEMENT_INGREDIENTS_REG =
-  /magnesium|trimagnesium|magnesiumcitrat|magnesiumsalze|magnesiumcarbonat|magnesiumaspartat|zink|zinc|eisen|iron|kalzium|kalcium|calcium|vitamin\s*[abcdekm]\s*\d*|vitamin\s*b6|vitamin\s*b12|vitamin\s*d|vitamin\s*c|pyridoxin|thiamin|riboflavin|cyanocobalamin|methylcobalamin|biotin|folsäure|folsaeure|folat|folate|coenzym|coenzyme|ubiquinon|melatonin|probiotik|probiotic|kollagen|collagen|carnitin|carnitine|selen|selenium|omega\s*[-]?\s*3|cholecalciferol|ergocalciferol|jod|iodine|chrom|chromium|mangan|manganese|kupfer|copper|lutein|inositol|taurin|taurine/gi;
+type WeightedRule = {
+  regex: RegExp;
+  weight: number;
+};
 
-// 补剂标签上下文：与配料词组合后才认为是高置信补剂。
-const SUPPLEMENT_CONTEXT_REG =
-  /nahrungsergänzungsmittel|nahrungsergaenzungsmittel|dietary\s*supplement|supplement\s*facts|einnahme|verzehrempfehlung|kapseln?|tabletten?|kapsel|tablet|softgel|servings?|dosage|daily\s*dose|portion|per\s*serving|tägliche|taegliche|tagesdosis/i;
+const UNIT_AFTER_NUMBER_REG = /(?<=\d)\s*(mg|mcg|µg|iu|ie|nrv)\b/gi;
+const STRONG_SUPP_RE =
+  /\b(naehrwert|nahrungsergaenzung(?:smittel)?|supplement facts|serving size)\b/i;
+const STRONG_SKIN_RE =
+  /\b(ingredients|bestandteile|inci|aqua|wasser|glycerin)\b/i;
+const ORAL_INSTRUCTION_RE =
+  /\b(einnehmen|swallow|daily dose|dosage|take with water|serving|taeglich)\b/i;
+const SKIN_ACTION_RE =
+  /\b(apply|skin|face|massage|gesicht|hals|auftragen|creme|cream|serum)\b/i;
+const VITAMIN_C_RE = /\bvitamin\s*c\b/i;
+const TOPICAL_VC_RE =
+  /\b(ascorbic|ascorbyl|palmitate|skin|face|cream|serum|haut|gesicht)\b/i;
 
-// 活性护肤成分：英文 + 德语
-const ACTIVE_SKINCARE_REG =
-  /retinol|retinal|retinyl|adapalene|tretinoin|ascorbic|ascorbinsäure|ascorbinsaeure|glycolic|glycolsäure|glycolsaeure|glykolsäure|glykolsaeure|lactic|milchsäure|milchsaure|salicylic|salicylsäure|salicylsaeure|niacinamide|niacinamid|peptide|peptid|aha|bha|mandelic|ferulic|kojic|hyaluron|hyaluronsäure|hyaluronsaeure|ceramid|ceramide|panthenol|benzoyl/i;
+const CREAM_NAME_SIGNALS_RE = /\b(cream|creme|balm|jelly|sorbet)\b/i;
+const SERUM_NAME_SIGNALS_RE = /\b(serum|essence|ampulle)\b/i;
+const JAR_CONTAINER_RE = /\b(jar|tiegel|dose)\b/i;
 
-// 面霜
-const CREAM_REG =
-  /cream|面霜|moisturizer|moisturiser|pflegecreme|tagescreme|nachtcreme|日霜|晚霜/i;
+const CREAM_BASE_RE =
+  /\b(cetearyl|carbomer|stearate|stearic|triglyceride|silica|dimethicone|isostearate|isononanoate|ethylhexyl|caprylic|butyrospermum|cera|wax|petrolatum|squalane|cetyl|stearyl|palmitate|myristate|behenyl|copolymer)\b/gi;
+const SERUM_BASE_RE =
+  /\b(hyaluronate|ascorbic|ferulic|propanediol|pentylene|butylene\s+glycol|dipropylene|glycereth|panthenol|niacinamide)\b/gi;
+const CLEANSER_RE =
+  /\b(betaine|sulfate|glucoside|isethionate|glutamate|amphoacetate|soap|reinigung|wash|cleanser|nettoyant)\b/gi;
+const SUNSCREEN_RE =
+  /\b(homosalate|octocrylene|avobenzone|salicylate|benzophenone|titanium\s+dioxide|zinc\s+oxide|lichtschutz|sunscreen|sonnen)\b/gi;
+const ACTIVE_WHITELIST_RE =
+  /\b(niacinamide|ascorbic|retinol|salicylic|glycolic|peptide|ceramide|bakuchiol|resveratrol|tocopherol|tranexamic)\b/gi;
 
-// 精华类产品名关键词（不依赖活性词）
-const ESSENCE_REG =
-  /serum|essence|ampoule|elixir|essenz|精华|精华液|原液|安瓶/i;
+const SKINCARE_BASE_MARKERS_RE =
+  /\b(aqua|wasser|glycerin|propanediol|butylene\s+glycol|pentylene\s+glycol|carbomer|dimethicone|cetearyl|caprylic|triglyceride)\b/i;
+const HINT_STRONG_MARKERS_RE =
+  /\b(serum|konzentrat|ampulle|ampoule|creme|cream|balm|butter|dropper|essence)\b/i;
 
-// 特殊成分：标签文字或高浓度活性
-const SPECIAL_REG =
-  /特殊成分|special\s*ingredient|tretinoin|tretinoïde|adapalene|高浓度|high\s*strength|prescription/i;
+const SUPPLEMENT_RULES: WeightedRule[] = [
+  { regex: /\b(nahrungsergaenzungsmittel|supplement facts|dietary supplement|verzehrempfehlung)\b/gi, weight: 20 },
+  { regex: /\b(kapseln?|tabletten?|capsules?|tablets?|softgels?|gummies?)\b/gi, weight: 10 },
+  { regex: /\b(einnehmen|schlucken|take with water|daily dose|tagesdosis|tagesportion)\b/gi, weight: 15 },
+  { regex: /\b(magnesium|zink|zinc|omega[\s-]?3|fischoel|folsaeure|biotin)\b/gi, weight: 10 },
+];
 
-// 发用产品关键词：用于强制把 `categoryHint` 设为 haircare
-const HAIRCARE_PRODUCT_REG =
-  /洗发水|shampoo|护发素|conditioner|发膜|hair\s*mask|去屑|anti[-\s]?dandruff|head\s*and\s*shoulders/i;
+const SHAMPOO_RULES: WeightedRule[] = [
+  { regex: /\b(shampoo|conditioner|spuelung|spülung|haarkur|antischuppen)\b/gi, weight: 20 },
+  { regex: /\b(ausspuelen|ausspülen|rinse off|ins nasse haar|apply to wet hair|lather)\b/gi, weight: 15 },
+  { regex: /\b(sodium laureth sulfate|sulfates?|sulfat|betaine|keratin|kopfhaut|scalp)\b/gi, weight: 15 },
+];
+
+const SKINCARE_RULES: WeightedRule[] = [
+  { regex: /\b(gesichtscreme|moisturizer|moisturiser|facial|serum|konzentrat|ampulle)\b/gi, weight: 10 },
+  { regex: /\b(morgens und abends|apply to skin|gesicht und hals|auftragen)\b/gi, weight: 10 },
+  { regex: /\b(niacinamide|retinol|hyaluron|squalane|ceramide)\b/gi, weight: 10 },
+];
+
+const AQUA_FIRST_REG = /^\s*aqua\b/i;
 
 const OCR_CORRECTION_WHITELIST: Record<string, string> = {
   methylpropional: "methylpropanediol",
@@ -59,41 +108,251 @@ function countMatches(text: string, reg: RegExp): number {
   return Array.from(text.matchAll(safeReg)).length;
 }
 
-function matchCategoryHint(text: string): CategoryHint {
-  if (HAIRCARE_PRODUCT_REG.test(text)) return "haircare";
-
-  const supplementContextHits = countMatches(text, SUPPLEMENT_CONTEXT_REG);
-  const supplementIngredientHits = countMatches(text, SUPPLEMENT_INGREDIENTS_REG);
-  const skincareActiveHits = countMatches(text, ACTIVE_SKINCARE_REG);
-
-  // 补剂优先规则：
-  // 1) 只要出现补剂上下文 + 至少1个补剂成分，即判为补剂；
-  // 2) 在无护肤活性冲突时，补剂强词>=3也判为补剂。
-  const confidentSupplement =
-    (supplementContextHits >= 1 && supplementIngredientHits >= 1) ||
-    (supplementContextHits >= 2 && supplementIngredientHits >= 0 && skincareActiveHits === 0) ||
-    (supplementIngredientHits >= 3 && skincareActiveHits === 0);
-
-  if (confidentSupplement) return "supplement";
-  // 业务默认：证据不足或冲突时按护肤处理。
-  return "skincare";
+function countRegexHits(text: string, re: RegExp): number {
+  const safeFlags = re.flags.includes("g")
+    ? re.flags
+    : `${re.flags}g`;
+  const safeRe = new RegExp(re.source, safeFlags);
+  const matches = text.match(safeRe);
+  return matches ? matches.length : 0;
 }
 
-function matchThinkingHint(text: string, categoryHint: CategoryHint): ThinkingHint | undefined {
-  if (categoryHint === "supplement") return "supplement";
-  if (categoryHint !== "skincare") return undefined;
-  if (SPECIAL_REG.test(text)) return "special";
-  if (ESSENCE_REG.test(text)) return "essence";
-  if (ACTIVE_SKINCARE_REG.test(text)) return "essence";
-  if (CREAM_REG.test(text)) return "cream";
-  return undefined;
+function normalizeForScoring(input: string): string {
+  return input
+    .toLowerCase()
+    .replace(/ä/g, "ae")
+    .replace(/ö/g, "oe")
+    .replace(/ü/g, "ue")
+    .replace(/ß/g, "ss");
+}
+
+function scoreByRules(text: string, rules: WeightedRule[]): number {
+  return rules.reduce((sum, rule) => sum + countMatches(text, rule.regex) * rule.weight, 0);
+}
+
+function clampNonNegative(v: number): number {
+  return Math.max(0, v);
+}
+
+function classifyProduct(correctedText: string, rawOcrText: string): {
+  kind: ClassifyKind;
+  scores: { supplement: number; shampoo: number; skincare: number };
+  margin: number;
+} {
+  const mainText = normalizeForScoring(correctedText).trim();
+  const rawText = normalizeForScoring(rawOcrText).trim();
+  const scoringText = mainText || rawText;
+  const headerText = scoringText.slice(0, 300);
+  const fullText = [mainText, rawText].filter(Boolean).join(" ");
+  let scores = { supplement: 0, shampoo: 0, skincare: 0 };
+
+  // Base scoring: corrected text is primary; raw text contributes as weak evidence.
+  const supplementMain =
+    scoreByRules(scoringText, SUPPLEMENT_RULES) +
+    countMatches(scoringText, UNIT_AFTER_NUMBER_REG) * 15;
+  const supplementRaw =
+    scoreByRules(rawText, SUPPLEMENT_RULES) +
+    countMatches(rawText, UNIT_AFTER_NUMBER_REG) * 15;
+  const shampooMain = scoreByRules(scoringText, SHAMPOO_RULES);
+  const shampooRaw = scoreByRules(rawText, SHAMPOO_RULES);
+  const skincareMainBase = scoreByRules(scoringText, SKINCARE_RULES);
+  const skincareRawBase = scoreByRules(rawText, SKINCARE_RULES);
+  const skincareMain = AQUA_FIRST_REG.test(scoringText)
+    ? skincareMainBase + 10
+    : skincareMainBase;
+  const skincareRaw = AQUA_FIRST_REG.test(rawText)
+    ? skincareRawBase + 10
+    : skincareRawBase;
+
+  scores = {
+    supplement: supplementMain + Math.round(supplementRaw * 0.25),
+    shampoo: shampooMain + Math.round(shampooRaw * 0.25),
+    skincare: skincareMain + Math.round(skincareRaw * 0.25),
+  };
+
+  // INCI structure / base-marker correction for ingredient-only crops.
+  const commaCount = (scoringText.match(/,/g) ?? []).length;
+  const inciChemicalHits = (
+    scoringText.match(/\b(ate|ol|ide|acid|glycol|amide|amine|polymer|extract)\b/g) ?? []
+  ).length;
+  const isINCIStructure = commaCount >= 4 && inciChemicalHits >= 3;
+  if (isINCIStructure || SKINCARE_BASE_MARKERS_RE.test(scoringText)) {
+    scores.skincare += 25;
+  }
+
+  // Structured breakers.
+  const isStrongSupplement = STRONG_SUPP_RE.test(scoringText);
+  const isStrongSkincare = STRONG_SKIN_RE.test(headerText);
+  const isOralInstruction = ORAL_INSTRUCTION_RE.test(scoringText);
+
+  // Pivot with anti-pivot protection.
+  const hasMl = /\bml\b/i.test(fullText);
+  const hasMg = /\b(mg|mcg|µg|iu|ie)\b/i.test(fullText);
+  const shouldProtectSupplement = isStrongSupplement || isOralInstruction;
+  if (hasMl && hasMg && !shouldProtectSupplement) {
+    scores.supplement = clampNonNegative(scores.supplement * 0.4);
+    scores.skincare += 20;
+  }
+
+  // Identity confirmation with mutual exclusion.
+  if (SKIN_ACTION_RE.test(scoringText)) {
+    scores.skincare += 25;
+    scores.supplement = clampNonNegative(scores.supplement - 15);
+  }
+  if (ORAL_INSTRUCTION_RE.test(scoringText)) {
+    scores.supplement += 25;
+    scores.skincare = clampNonNegative(scores.skincare - 10);
+  }
+
+  // Vitamin C special correction.
+  if (VITAMIN_C_RE.test(scoringText)) {
+    const isTopicalVC = TOPICAL_VC_RE.test(scoringText);
+    if (isTopicalVC && !isStrongSupplement) {
+      scores.skincare += 25;
+      scores.supplement = clampNonNegative(scores.supplement - 15);
+    }
+  }
+
+  // Final sanitization before ranking.
+  scores = {
+    supplement: clampNonNegative(scores.supplement),
+    shampoo: clampNonNegative(scores.shampoo),
+    skincare: clampNonNegative(scores.skincare),
+  };
+
+  const ranked = (Object.entries(scores) as Array<
+    [keyof typeof scores, number]
+  >).sort((a, b) => b[1] - a[1]);
+  const winner = ranked[0][0];
+  const topScore = ranked[0][1];
+  const margin = topScore - ranked[1][1];
+  const minMargin = isStrongSkincare || isStrongSupplement ? 2 : 5;
+  if (topScore < 10 || margin < minMargin) {
+    return {
+      kind: "unknown",
+      scores,
+      margin,
+    };
+  }
+
+  if (winner === "supplement") {
+    return {
+      kind: "supplement",
+      scores,
+      margin,
+    };
+  }
+  if (winner === "shampoo") {
+    return {
+      kind: "shampoo",
+      scores,
+      margin,
+    };
+  }
+
+  // Guardrail: strong oral/supplement cues should not enter skincare subtype.
+  if (
+    (isStrongSupplement || isOralInstruction) &&
+    scores.supplement >= scores.skincare - 5
+  ) {
+    return {
+      kind: "supplement",
+      scores,
+      margin,
+    };
+  }
+
+  // --- Enter skincare second-stage classification ---
+  let subtypeScore = 0;
+  const textLower = scoringText.toLowerCase();
+
+  // A. Priority interceptors: cleanser/sunscreen should not enter deep subtyping.
+  if (
+    countRegexHits(textLower, CLEANSER_RE) > 0 ||
+    countRegexHits(textLower, SUNSCREEN_RE) > 0
+  ) {
+    return { kind: "skincare_cream", scores, margin };
+  }
+
+  // B. Name/texture signal weights.
+  if (SERUM_NAME_SIGNALS_RE.test(scoringText)) subtypeScore += 30;
+  if (CREAM_NAME_SIGNALS_RE.test(scoringText)) subtypeScore -= 30;
+  if (JAR_CONTAINER_RE.test(scoringText)) {
+    subtypeScore -= 25;
+  }
+
+  // C. Ingredient-density scoring.
+  const creamHits = countRegexHits(textLower, CREAM_BASE_RE);
+  const serumHits = countRegexHits(textLower, SERUM_BASE_RE);
+  subtypeScore -= creamHits * 10;
+  subtypeScore += serumHits * 8;
+
+  // D. Decision thresholds.
+  let finalKind: ClassifyKind = "skincare_cream";
+  if (subtypeScore >= 18) finalKind = "skincare_serum";
+  if (subtypeScore <= -18) finalKind = "skincare_cream";
+
+  return {
+    kind: finalKind,
+    scores,
+    margin,
+  };
+}
+
+function classifyKindToHints(
+  kind: ClassifyKind,
+  text: string
+): {
+  categoryHint?: CategoryHint;
+  thinkingHint?: ThinkingHint;
+} {
+  if (kind === "supplement") {
+    return {
+      categoryHint: "supplement",
+      thinkingHint: "supplement",
+    };
+  }
+  if (kind === "shampoo") {
+    return {
+      categoryHint: "haircare",
+    };
+  }
+  if (kind === "skincare_serum") {
+    const normalized = normalizeForScoring(text);
+    const hasStrongType = HINT_STRONG_MARKERS_RE.test(normalized);
+    const hasActives = countRegexHits(normalized, ACTIVE_WHITELIST_RE) > 0;
+    if (!hasStrongType && !hasActives) {
+      return {
+        categoryHint: "skincare",
+      };
+    }
+    return {
+      categoryHint: "skincare",
+      thinkingHint: "essence",
+    };
+  }
+  if (kind === "skincare_cream") {
+    const normalized = normalizeForScoring(text);
+    const hasStrongType = HINT_STRONG_MARKERS_RE.test(normalized);
+    const hasActives = countRegexHits(normalized, ACTIVE_WHITELIST_RE) > 0;
+    if (!hasStrongType && !hasActives) {
+      return {
+        categoryHint: "skincare",
+      };
+    }
+    return {
+      categoryHint: "skincare",
+      thinkingHint: "cream",
+    };
+  }
+  return {};
 }
 
 async function extractTextWeb(base64: string): Promise<string> {
   const { createWorker } = await import("tesseract.js");
   const cleanBase64 = base64.replace(/^data:image\/\w+;base64,/, "");
   const dataUrl = `data:image/jpeg;base64,${cleanBase64}`;
-  const worker = await createWorker("eng+chi_sim+deu", 1, { logger: () => {} });
+  const worker = await createWorker("eng+deu", 1, { logger: () => {} });
   try {
     const {
       data: { text },
@@ -208,7 +467,7 @@ function normalizeOcrNoise(input: string): string {
 function looksLikeNoiseLine(line: string): boolean {
   const n = line.toLowerCase().trim();
   if (!n) return true;
-  return /usage|directions|warning|caution|keep out|avoid contact|for external use|net wt|www\.|http|barcode|batch|lot|expiry|exp|mfg|manufactured|distributed|客服|注意事项|警告|使用方法|净含量/u.test(
+  return /usage|directions|warning|caution|keep out|avoid contact|for external use|net wt|www\.|http|barcode|batch|lot|expiry|exp|mfg|manufactured|distributed/u.test(
     n
   );
 }
@@ -313,27 +572,63 @@ export async function guessThinkingHint(options: {
   categoryHint?: CategoryHint;
   ocrText?: string;
 }> {
-  let text = "";
+  const detected = await detectOcrAndHints(options);
+  return {
+    thinkingHint: detected.thinkingHint,
+    categoryHint: detected.categoryHint,
+    ocrText: detected.ocrText,
+  };
+}
+
+export async function detectOcrAndHints(options: {
+  uri?: string;
+  base64?: string;
+}): Promise<OcrDetectionResult> {
+  let detected: {
+    rawOcrText: string;
+    correctedText: string;
+    confidenceHint: OcrConfidenceHint;
+  };
   try {
-    text = await extractRawText(options);
+    detected = await extractCorrectedIngredientText(options);
   } catch (e) {
     if (__DEV__) {
       console.log("[ocrDetect] OCR failed:", e);
     }
-    return {};
+    return {
+      rawOcrText: "",
+      correctedText: "",
+      confidenceHint: "low",
+      ocrText: "",
+    };
   }
-  const categoryHint = matchCategoryHint(text);
-  const thinkingHint = matchThinkingHint(text, categoryHint);
+  const corrected = detected.correctedText.trim();
+  const raw = detected.rawOcrText.trim();
+  const mergedText = [corrected, raw].filter(Boolean).join("\n");
+  const classified = classifyProduct(corrected, raw);
+  const hints = classifyKindToHints(classified.kind, corrected || raw);
 
   if (__DEV__) {
-    console.log("[ocrDetect] platform:", Platform.OS, "| hasBase64:", !!options.base64, "| hasUri:", !!options.uri);
-    console.log("[ocrDetect] text preview:", text.slice(0, 200));
+    console.log(
+      "[ocrDetect] platform:",
+      Platform.OS,
+      "| hasBase64:",
+      !!options.base64,
+      "| hasUri:",
+      !!options.uri
+    );
+    console.log("[ocrDetect] raw preview:", raw.slice(0, 200));
+    console.log("[ocrDetect] corrected preview:", corrected.slice(0, 200));
     console.log(
       "[ocrDetect] match:",
       JSON.stringify(
         {
-          thinkingHint: thinkingHint ?? "none",
-          categoryHint: categoryHint ?? "none",
+          confidenceHint: detected.confidenceHint,
+          thinkingHint: hints.thinkingHint ?? "none",
+          categoryHint: hints.categoryHint ?? "none",
+          classifyKind: classified.kind,
+          scores: classified.scores,
+          margin: classified.margin,
         },
         null,
         2
@@ -341,5 +636,38 @@ export async function guessThinkingHint(options: {
     );
   }
 
-  return { thinkingHint, categoryHint, ocrText: text };
+  return {
+    rawOcrText: detected.rawOcrText,
+    correctedText: detected.correctedText,
+    confidenceHint: detected.confidenceHint,
+    categoryHint: hints.categoryHint,
+    thinkingHint: hints.thinkingHint,
+    ocrText: mergedText,
+  };
+}
+
+export function resolveHintDecision(options: {
+  confidenceHint: OcrConfidenceHint;
+  categoryHint?: CategoryHint;
+  thinkingHint?: ThinkingHint;
+}): ResolvedHintDecision | null {
+  const { confidenceHint: _confidenceHint, categoryHint, thinkingHint } = options;
+  if (!categoryHint) return null;
+
+  if (categoryHint === "haircare") {
+    return { categoryHint: "haircare" };
+  }
+
+  if (categoryHint === "supplement") {
+    return {
+      categoryHint: "supplement",
+      thinkingHint: "supplement",
+    };
+  }
+
+  if (thinkingHint === "essence" || thinkingHint === "cream") {
+    return { categoryHint: "skincare", thinkingHint };
+  }
+
+  return { categoryHint: "skincare" };
 }

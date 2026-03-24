@@ -104,6 +104,8 @@ export type AnalysisResult = {
     skin_types: SkinTypeToken[];
     avoid_groups: string[];
   };
+  /** Same strings as model `expert_advice`; API mirrors into `tips`. */
+  expert_advice?: string[];
   tips: string[];
 };
 

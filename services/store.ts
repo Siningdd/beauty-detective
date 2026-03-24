@@ -6,6 +6,14 @@
 import type { AnalysisResult } from "../types/analysis";
 
 let reportCache: AnalysisResult | null = null;
+export type PendingAnalysisParams = {
+  base64: string;
+  mimeType: string;
+  categoryHint?: "skincare" | "supplement" | "haircare";
+  thinkingHint?: "supplement" | "essence" | "cream" | "special";
+  ingredientText?: string;
+};
+let pendingAnalysisParams: PendingAnalysisParams | null = null;
 
 export function setReport(report: AnalysisResult) {
   reportCache = report;
@@ -17,6 +25,18 @@ export function getReport(): AnalysisResult | null {
 
 export function clearReport() {
   reportCache = null;
+}
+
+export function setAnalysisParams(params: PendingAnalysisParams) {
+  pendingAnalysisParams = params;
+}
+
+export function getAnalysisParams(): PendingAnalysisParams | null {
+  return pendingAnalysisParams;
+}
+
+export function clearAnalysisParams() {
+  pendingAnalysisParams = null;
 }
 
 let pendingImage: {

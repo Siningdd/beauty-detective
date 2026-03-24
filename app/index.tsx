@@ -9,7 +9,7 @@ import {
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import { Animated } from "react-native";
-import { setReport, setPendingImage } from "../services/store";
+import { clearReport, setReport, setPendingImage } from "../services/store";
 import { MOCK_REPORT } from "../services/mockReport";
 import {
   BG,
@@ -57,6 +57,7 @@ export default function HomeScreen() {
 
   const pickImage = async (useCamera: boolean) => {
     setError(null);
+    clearReport();
     try {
       const launcher = useCamera
         ? ImagePicker.launchCameraAsync

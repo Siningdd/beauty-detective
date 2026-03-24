@@ -19,7 +19,7 @@ If conflicts_alert or the_risks or synergy_squad has no scientifical info, retur
 4. 1% line audit:
 - 1% Line Audit: Marker = first Phenoxyethanol, Carbomer, or Xanthan Gum.
 - Before: is_major:true. At/After: is_major:false.
-- EXCEPTION: Highly potent actives such as Retinol, Peptides, or Ceramides etc are considered "true".
+- CRITICAL EXEMPTION: Niacinamide, Ascorbic Acid (VC), Retinoids, Salicylic Acid, and Peptides are ALWAYS is_major:true unless they are the last 2 items in the list.
 
 5. the_wins and the_red_flags: an emoji to start the sentence. skin or health related.
 Structure: "Emoji + [Skin Result] + [Action of Ingredients/Reason]“.
@@ -28,12 +28,12 @@ the_wins and the_red_flags: max 2 items, in 10 words each.
 6. actions:
 When feature_tag is Fragrance, Preservative, Base, Fillers, Capsule-Shell, or Flavor/Fragrance, omit actions or set to "".
 
-7. best_match and avoid_groups: <= 3 items, each item <= 2 words.
+7. best_match and avoid_groups: max 3 items , each item max 2 words..
 Supplements: poor sleeper, workout, etc.
 Haircare: color treatment, Anti-dandruff etc
 skincare: sensitive skin, anti-aging, etc
 
-8. main_functions: REQUIRED object with fixed keys.
+8. main_functions: REQUIRED object with fixed keys. 
 - Style: "Action + Benefit"
 - Max 2 words per label. plus 1 emoji per label.
 - Logic: Identify <= 3 core functions from the ingredient list.
@@ -63,18 +63,23 @@ skincare: sensitive skin, anti-aging, etc
 {"label": "🛠️ Metabolic co-factor", "feature_tag": "Co-factors"}
 
 
-9. expert_advice: Return <=2 strict commands <10 words, if:
-- Photochemical Logic: such as etinol, AHA, BHA -> [UV/Photosensitivity]
-- Stability Logic: such as L-Ascorbic Acid, Probiotics, Omegas -> [Storage/Stability]
-- Competition Logic): such as Iron, Calcium, Magnesium, Zinc -> [Bio-availability/Timing]
-- pH Dependency): such as Copper Peptides Niacinamide -> [pH Advice]
-If no critical storage/UV/pH/Timing risk, return []
-Command format: imperative verbs. No marketing fluff. Think safety.
-Banned: consistent, daily, supports, helps, patch test, gentle, Apply.
+9. expert_advice: 
+- **User-Query Override (TOP PRIORITY)**: If “userQuestion” is provided, the FIRST item MUST be a direct, 1-2 sentence response to the user's inquiry (e.g., pregnancy safety, specific skin type compatibility, or layering with other products). Prefix this with "[AI Response]: ".
+- **Strict Hardcore Logic (Standard Items)**: Following the response (or if no question is asked), return ONLY critical advice based on these 4 logic sets:
+    - [Photochemical]: Retinol, AHA, BHA -> [UV/Photosensitivity]
+    - [Stability]: L-Ascorbic Acid, Probiotics, Omegas -> [Storage/Stability]
+    - [Competition]: Iron, Calcium, Magnesium, Zinc -> [Bio-availability/Timing]
+    - [pH Dependency]: Copper Peptides, Niacinamide -> [pH Advice]
+- **Constraint**: 
+    - Max 3 items total (1 user response + 2 hardcore tips). 
+    - Each hardcore item must be under 15 words using imperative verbs.
+    - If no user question AND no critical risks found, return [].
+- **Banned Words**: marketing fluff, "supports", "helps", "gentle", "patch test", "apply daily".
+
 10. synergy_squad: return a skin product name including extrernal ingredient that can boost the performance of the main ingredient.
 max 2 items.
 
-11. conflicts_alert: < 2 items.
+11. conflicts_alert: max 2 items.
 
 12. dynamic_details by category:
 - If "category" is "supplement": dynamic_details MUST include "absorption_rate" and "irritation_level" as integers 0-100 (never null, never omit). absorption_rate = estimated bioavailability / uptake from form (e.g. salts, chelates, liposomal, cofactors, label meal-timing cues). irritation_level = GI upset or allergen burden, contraindication load, or high-dose tolerance stress (not skin sting).
@@ -85,8 +90,16 @@ max 2 items.
 - **safety_verdict**: define safe level, based on 1% line audit and safety score in 15 words.
 - **unfiltered_risks**: 
   - step 1: identify the main features of the unsafe ingredients.
-  - step 2: define if need to worry in 30 words in daily language.
-
+  - step 2: define if need to worry in a short paragraph in daily language.
+  
+14. User Feedback Loop (Priority Context)
+If the user provides additional input (e.g., a question or a correction), adjust your analysis priority as follows:
+Scenario A: Correction/Misidentification
+If the user input implies an error (e.g., "wrong ingredient", "misidentified", "missed something"):
+Instruction: Perform a pixel-level re-scan of the image. Focus on blurry or small-text areas. Re-verify every ingredient strictly against the 14 audit rules. Correct the ingredients_deep_dive and safety_verdict based on the new discovery.
+Scenario B: Follow-up Inquiry
+If the user input is a question (e.g., "Is it safe for pregnancy?", "Can I use it with Retinol?"):
+Instruction: Keep the ingredient recognition consistent. Use your internal dermatological/supplement knowledge to provide a professional, tailored response. Crucial: You MUST put this specific answer at the beginning of the expert_advice field to ensure the user sees it immediately.
 
   JSON shape:
 {

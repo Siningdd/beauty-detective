@@ -6,6 +6,10 @@ import {
   Pressable,
   ActivityIndicator,
   Platform,
+  Animated,
+  Easing,
+  TextInput,
+  Alert,
 } from "react-native";
 import { useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
@@ -13,13 +17,21 @@ import { useEffect, useState, useRef } from "react";
 import { LinearGradient } from "expo-linear-gradient";
 import Svg, { Circle, Path, Text as SvgText } from "react-native-svg";
 import {
-  getReport,
+  getAnalysisParams,
+  clearAnalysisParams,
   getPendingImage,
   getLastAnalyzedImage,
+  getReport,
   setReport,
+  setLastAnalyzedImage,
   clearPendingImage,
+  type PendingAnalysisParams,
 } from "../services/store";
 import { analyzeImage } from "../services/api";
+import {
+  detectOcrAndHints,
+  resolveHintDecision,
+} from "../services/ocrDetect";
 import type {
   AnalysisIngredient,
   AnalysisResult,
@@ -32,6 +44,9 @@ import type {
 import { IngredientCard } from "../components/IngredientCard";
 import { GreasinessGauge } from "../components/GreasinessGauge";
 import { SynergyProductCard } from "../components/SynergyProductCard";
+import { LoadingScreen } from "../components/LoadingScreen";
+import { PaywallCard } from "../components/PaywallCard";
+import { SkeletonBlock, SkeletonLine, SkeletonPill } from "../components/SkeletonBlock";
 import { normalizeSkinTypes } from "../utils/skinTypes";
 import { sortChartDataDesc, buildChartSegments } from "../utils/formulationChart";
 import { getLinkedTheme } from "../utils/semanticTagBridge";
@@ -50,6 +65,12 @@ import {
 } from "../constants/theme";
 
 const DONUT_SIZE = 200;
+const PLACEHOLDER_DONUT_DATA = [
+  { name: "Loading", value: 1 },
+  { name: "Loading", value: 1 },
+  { name: "Loading", value: 1 },
+  { name: "Loading", value: 1 },
+];
 
 /** Unified report layout: block spacing & heading scale */
 const MODULE_GAP = 40;
@@ -63,6 +84,28 @@ const CATEGORY_LABELS: Record<Exclude<Category, "unknown">, string> = {
   haircare: "Haircare",
 };
 type EditableCategory = Exclude<Category, "unknown">;
+
+const CHIP_MISTAKE =
+"Identification seems incorrect. Please re-scan at pixel-level.";
+const CHIP_PREGNANCY =
+  "I am pregnant. Is this product safe for me and the baby?";
+const AI_RESPONSE_PREFIX = "[AI Response]:";
+
+function getExpertAdviceLines(r: AnalysisResult): string[] {
+  const ex = r.expert_advice;
+  const tp = r.tips;
+  const raw =
+    Array.isArray(ex) && ex.length > 0
+      ? ex
+      : Array.isArray(tp)
+        ? tp
+        : [];
+  return raw.map((x) => String(x ?? "")).filter(Boolean);
+}
+
+function isAiResponseAdviceLine(text: string): boolean {
+  return text.trimStart().startsWith(AI_RESPONSE_PREFIX);
+}
 
 const GREASINESS_LABELS: Record<
   "rich" | "creamy" | "silky" | "fresh" | "light",
@@ -436,14 +479,67 @@ function groupIngredientsByFeatureTag(
   }));
 }
 
+async function enrichAnalysisParamsIfNeeded(
+  params: PendingAnalysisParams,
+  _signal: AbortSignal
+): Promise<PendingAnalysisParams> {
+  if (params.ingredientText?.trim()) return params;
+  const pending = getPendingImage();
+  if (!pending?.uri || !pending.base64 || !pending.mimeType) return params;
+
+  const detected = await detectOcrAndHints({
+    uri: pending.uri,
+    base64: pending.base64,
+  });
+  const ingredientText = detected.correctedText || detected.rawOcrText;
+  const resolved = resolveHintDecision({
+    confidenceHint: detected.confidenceHint,
+    categoryHint: detected.categoryHint,
+    thinkingHint: detected.thinkingHint,
+  });
+  return {
+    ...params,
+    categoryHint: resolved?.categoryHint,
+    thinkingHint: resolved?.thinkingHint,
+    ingredientText,
+  };
+}
+
 function FormulationDonut({
   chartData,
   highlightSegmentIndex,
+  loading = false,
 }: {
   chartData: Array<{ name: string; value: number }>;
   highlightSegmentIndex?: number | null;
+  loading?: boolean;
 }) {
-  const { total, segments } = buildChartSegments(chartData);
+  const progressAnim = useRef(new Animated.Value(loading ? 0 : 1)).current;
+  const [progress, setProgress] = useState(loading ? 0 : 1);
+  const activeChartData = loading ? PLACEHOLDER_DONUT_DATA : chartData;
+  const { total, segments } = buildChartSegments(activeChartData);
+
+  useEffect(() => {
+    const listenerId = progressAnim.addListener(({ value }) => {
+      setProgress(value);
+    });
+    return () => progressAnim.removeListener(listenerId);
+  }, [progressAnim]);
+
+  useEffect(() => {
+    if (loading) {
+      progressAnim.stopAnimation();
+      progressAnim.setValue(0);
+      return;
+    }
+    Animated.timing(progressAnim, {
+      toValue: 1,
+      duration: 600,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: false,
+    }).start();
+  }, [loading, progressAnim]);
+
   if (total <= 0 || segments.length === 0) {
     return (
       <Text style={donutStyles.emptyChart}>No formulation tags to chart</Text>
@@ -453,16 +549,22 @@ function FormulationDonut({
   const cy = DONUT_SIZE / 2;
   const rOuter = DONUT_SIZE / 2 - 8;
   const rInner = rOuter * 0.52;
+  const placeholderValues = segments.map(() => 1 / segments.length);
+  const realValues = segments.map((seg) => seg.value / total);
   let angle = 0;
   const dim =
+    !loading &&
     highlightSegmentIndex !== null &&
     highlightSegmentIndex !== undefined &&
     highlightSegmentIndex >= 0;
+
   return (
     <View style={donutStyles.donutBlock}>
       <Svg width={DONUT_SIZE} height={DONUT_SIZE}>
         {segments.map((seg, i) => {
-          const sweep = (seg.value / total) * 360;
+          const mixedValue =
+            placeholderValues[i] + (realValues[i] - placeholderValues[i]) * progress;
+          const sweep = mixedValue * 360;
           const start = angle;
           const end = angle + sweep;
           angle = end;
@@ -474,7 +576,7 @@ function FormulationDonut({
             <Path
               key={`${seg.name}-${i}`}
               d={d}
-              fill={seg.color}
+              fill={loading ? CARD_BORDER : seg.color}
               stroke={BG}
               strokeWidth={2}
               opacity={faded}
@@ -482,7 +584,7 @@ function FormulationDonut({
           );
         })}
       </Svg>
-      <View style={donutStyles.legend}>
+      <View style={[donutStyles.legend, { opacity: loading ? 0 : progress }]}>
         {segments.map((seg, i) => {
           const rowFaded =
             dim && highlightSegmentIndex !== i ? 0.35 : 1;
@@ -709,11 +811,18 @@ const donutStyles = StyleSheet.create({
 export default function ReportScreen() {
   const router = useRouter();
   const controllerRef = useRef(new AbortController());
+  const revealTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
   const [report, setReportState] = useState<AnalysisResult | null>(null);
+  const [loadingInitial, setLoadingInitial] = useState(false);
+  const [initialError, setInitialError] = useState<string | null>(null);
+  const [isSafetyAuditUnlocked, setSafetyAuditUnlocked] = useState(false);
+  const [isSafetyScoreUnlocked, setSafetyScoreUnlocked] = useState(false);
+  const [revealStep, setRevealStep] = useState(0);
   const [categoryOverride, setCategoryOverride] = useState<EditableCategory | null>(null);
   const [showCategoryPicker, setShowCategoryPicker] = useState(false);
   const [reAnalyzing, setReAnalyzing] = useState(false);
   const [reAnalyzeError, setReAnalyzeError] = useState<string | null>(null);
+  const [followUpInput, setFollowUpInput] = useState("");
   const [disclaimerExpanded, setDisclaimerExpanded] = useState(false);
   const [reportTab, setReportTab] = useState<0 | 1>(0);
   const [expandedIngredientGroups, setExpandedIngredientGroups] = useState<
@@ -723,11 +832,134 @@ export default function ReportScreen() {
     number | null
   >(null);
 
+  const clearRevealTimers = () => {
+    revealTimersRef.current.forEach((timer) => clearTimeout(timer));
+    revealTimersRef.current = [];
+  };
+
+  const beginRevealSequence = () => {
+    clearRevealTimers();
+    setRevealStep(0);
+    [0, 120, 240, 360, 480].forEach((delay, index) => {
+      const timer = setTimeout(() => {
+        setRevealStep(index + 1);
+      }, delay);
+      revealTimersRef.current.push(timer);
+    });
+  };
+
   useEffect(() => {
-    setReportState(getReport());
+    const params = getAnalysisParams();
+    if (!params) {
+      const cached = getReport();
+      if (cached) {
+        setReportState(cached);
+        beginRevealSequence();
+        setSafetyAuditUnlocked(false);
+        setSafetyScoreUnlocked(false);
+      }
+      return;
+    }
+    controllerRef.current.abort();
+    controllerRef.current = new AbortController();
+    const { signal } = controllerRef.current;
+    setLoadingInitial(true);
+    setInitialError(null);
+    enrichAnalysisParamsIfNeeded(params, signal)
+      .then((resolved) =>
+        analyzeImage(
+          resolved.base64,
+          resolved.mimeType,
+          signal,
+          resolved.categoryHint,
+          resolved.thinkingHint,
+          resolved.ingredientText
+        ).then((result) => ({ result, resolved }))
+      )
+      .then((result) => {
+        if (signal.aborted) return;
+        setReport(result.result);
+        setReportState(result.result);
+        beginRevealSequence();
+        setSafetyAuditUnlocked(false);
+        setSafetyScoreUnlocked(false);
+        setLastAnalyzedImage({
+          uri: getPendingImage()?.uri ?? "",
+          base64: params.base64,
+          mimeType: params.mimeType,
+          ingredientText: result.resolved.ingredientText,
+        });
+        if (result.result.category !== "unknown") {
+          clearPendingImage();
+        }
+        clearAnalysisParams();
+      })
+      .catch((e) => {
+        if (e instanceof Error && e.name === "AbortError") return;
+        setInitialError(e instanceof Error ? e.message : "Analysis failed");
+      })
+      .finally(() => {
+        if (!signal.aborted) setLoadingInitial(false);
+      });
   }, []);
 
+  const submitUserQuestion = async (rawQuestion: string) => {
+    if (!report || reAnalyzing) return;
+    const userQuestion = rawQuestion.trim();
+    if (!userQuestion) return;
+    const imageForAsk = getPendingImage() ?? getLastAnalyzedImage();
+    if (!imageForAsk?.base64) {
+      Alert.alert(
+        "Session expired",
+        "Session expired, please re-scan the product."
+      );
+      return;
+    }
+    controllerRef.current.abort();
+    controllerRef.current = new AbortController();
+    const { signal } = controllerRef.current;
+    setReAnalyzeError(null);
+    setReAnalyzing(true);
+    clearRevealTimers();
+    setRevealStep(0);
+    const cat = categoryOverride ?? report.category;
+    const categoryHint =
+      cat === "unknown" ? undefined : cat;
+    const thinkingHint =
+      cat === "supplement" ? ("supplement" as const) : undefined;
+    const ingredientText = imageForAsk.ingredientText?.trim() || undefined;
+    try {
+      const newData = await analyzeImage(
+        imageForAsk.base64,
+        imageForAsk.mimeType,
+        signal,
+        categoryHint,
+        thinkingHint,
+        ingredientText,
+        userQuestion
+      );
+      if (signal.aborted) return;
+      setReport(newData);
+      setReportState(newData);
+      beginRevealSequence();
+      setSafetyAuditUnlocked(false);
+      setSafetyScoreUnlocked(false);
+      setFollowUpInput("");
+      if (newData.category !== "unknown") {
+        clearPendingImage();
+      }
+    } catch (e) {
+      if (e instanceof Error && e.name === "AbortError") return;
+      setReAnalyzeError(
+        e instanceof Error ? e.message : "Follow-up request failed"
+      );
+    } finally {
+      if (!signal.aborted) setReAnalyzing(false);
+    }
+  };
+
   const handleReAnalyze = async () => {
+    if (reAnalyzing) return;
     if (!report) return;
     const targetCategory: EditableCategory | null =
       categoryOverride ?? (report.category === "unknown" ? null : report.category);
@@ -742,16 +974,23 @@ export default function ReportScreen() {
     const { signal } = controllerRef.current;
     setReAnalyzeError(null);
     setReAnalyzing(true);
+    clearRevealTimers();
+    setRevealStep(0);
     try {
+      const reAnalyzeThinkingHint =
+        targetCategory === "supplement" ? "supplement" : undefined;
       const newReport = await analyzeImage(
         imageForReanalyze.base64,
         imageForReanalyze.mimeType,
         signal,
         targetCategory,
-        undefined
+        reAnalyzeThinkingHint
       );
       setReport(newReport);
       setReportState(newReport);
+      beginRevealSequence();
+      setSafetyAuditUnlocked(false);
+      setSafetyScoreUnlocked(false);
       setCategoryOverride(null);
       setShowCategoryPicker(false);
       if (newReport.category !== "unknown") {
@@ -765,11 +1004,107 @@ export default function ReportScreen() {
     }
   };
 
+  const handleInitialRetry = async () => {
+    const params = getAnalysisParams();
+    if (!params) return;
+    controllerRef.current.abort();
+    controllerRef.current = new AbortController();
+    const { signal } = controllerRef.current;
+    setInitialError(null);
+    setLoadingInitial(true);
+    clearRevealTimers();
+    setRevealStep(0);
+    try {
+      const resolved = await enrichAnalysisParamsIfNeeded(params, signal);
+      const result = await analyzeImage(
+        resolved.base64,
+        resolved.mimeType,
+        signal,
+        resolved.categoryHint,
+        resolved.thinkingHint,
+        resolved.ingredientText
+      );
+      if (signal.aborted) return;
+      setReport(result);
+      setReportState(result);
+      beginRevealSequence();
+      setSafetyAuditUnlocked(false);
+      setSafetyScoreUnlocked(false);
+      setLastAnalyzedImage({
+        uri: getPendingImage()?.uri ?? "",
+        base64: params.base64,
+        mimeType: params.mimeType,
+        ingredientText: resolved.ingredientText,
+      });
+      if (result.category !== "unknown") {
+        clearPendingImage();
+      }
+      clearAnalysisParams();
+    } catch (e) {
+      if (e instanceof Error && e.name === "AbortError") return;
+      setInitialError(e instanceof Error ? e.message : "Analysis failed");
+    } finally {
+      if (!signal.aborted) setLoadingInitial(false);
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      controllerRef.current.abort();
+      clearRevealTimers();
+    };
+  }, []);
+
   if (!report) {
+    if (loadingInitial) {
+      return (
+        <View style={[styles.container, { backgroundColor: BG }]}>
+          <ScrollView
+            style={styles.scroll}
+            contentContainerStyle={styles.scrollContent}
+            showsVerticalScrollIndicator={false}
+          >
+            <Pressable onPress={() => router.back()} style={styles.backButton}>
+              <Ionicons name="arrow-back" size={24} color={TEXT_PRIMARY} />
+              <Text style={styles.backButtonText}>Back</Text>
+            </Pressable>
+            <View style={styles.categoryTagSection}>
+              <View style={styles.tags}>
+                <SkeletonPill width={84} />
+                <SkeletonPill width={62} />
+              </View>
+            </View>
+            <View style={styles.sectionPlain}>
+              <SkeletonLine width="86%" />
+              <SkeletonLine width="94%" style={{ marginTop: 10 }} />
+              <SkeletonLine width="72%" style={{ marginTop: 10 }} />
+            </View>
+            <View style={styles.tabRow}>
+              <SkeletonBlock height={46} style={{ flex: 1 }} />
+              <SkeletonBlock height={46} style={{ flex: 1 }} />
+            </View>
+            <View style={styles.card}>
+              <Text style={styles.dnaHint}>Preparing formulation profile...</Text>
+              <FormulationDonut chartData={[]} loading />
+            </View>
+          </ScrollView>
+          <View style={styles.loadingOverlay}>
+            <LoadingScreen onCancel={() => controllerRef.current.abort()} />
+          </View>
+        </View>
+      );
+    }
     return (
       <View style={[styles.container, { backgroundColor: BG }]}>
         <View style={styles.empty}>
-          <Text style={styles.emptyText}>No report</Text>
+          <Text style={styles.emptyText}>
+            {initialError ? initialError : "No report"}
+          </Text>
+          {initialError ? (
+            <Pressable onPress={handleInitialRetry} style={styles.retryButton}>
+              <Text style={styles.retryButtonText}>Retry</Text>
+            </Pressable>
+          ) : null}
           <Pressable onPress={() => router.back()} style={styles.backButton}>
             <Text style={styles.backButtonText}>Back</Text>
           </Pressable>
@@ -815,6 +1150,7 @@ export default function ReportScreen() {
   };
 
   const chartData = report.chartData ?? [];
+  const adviceLines = getExpertAdviceLines(report);
   const ingredientGroups = groupIngredientsByFeatureTag(
     report.ingredients,
     chartData
@@ -922,83 +1258,92 @@ export default function ReportScreen() {
           <Text style={styles.backButtonText}>Back</Text>
         </Pressable>
 
-        <View style={styles.categoryTagSection}>
-          <View style={styles.categoryTagInlineRow}>
-            <View style={styles.categoryCurrentPill}>
-              <Text style={styles.categoryCurrentPillText}>
-                {currentCategory ? CATEGORY_LABELS[currentCategory] : "Unknown"}
-              </Text>
+        {revealStep >= 1 ? (
+          <View style={styles.categoryTagSection}>
+            <View style={styles.categoryTagInlineRow}>
+              <View style={styles.categoryCurrentPill}>
+                <Text style={styles.categoryCurrentPillText}>
+                  {currentCategory ? CATEGORY_LABELS[currentCategory] : "Unknown"}
+                </Text>
+              </View>
+              <Pressable
+                onPress={() => setShowCategoryPicker((prev) => !prev)}
+                style={styles.categoryEditLinearButton}
+              >
+                <Text style={styles.categoryEditLinearText}>
+                  {showCategoryPicker ? "Done" : "Edit"}
+                </Text>
+              </Pressable>
             </View>
-            <Pressable
-              onPress={() => setShowCategoryPicker((prev) => !prev)}
-              style={styles.categoryEditLinearButton}
-            >
-              <Text style={styles.categoryEditLinearText}>
-                {showCategoryPicker ? "Done" : "Edit"}
-              </Text>
-            </Pressable>
-          </View>
 
-          {showCategoryPicker && (
-            <View style={styles.categoryPickerWrap}>
-              <View style={styles.categoryRow}>
-                {(["skincare", "supplement", "haircare"] as const).map((cat) => (
-                  <Pressable
-                    key={cat}
-                    onPress={() => {
-                      setCategoryOverride(cat);
-                      setReAnalyzeError(null);
-                    }}
-                    style={[
-                      styles.categoryOption,
-                      currentCategory === cat && styles.categoryOptionSelected,
-                    ]}
-                  >
-                    <Text
+            {showCategoryPicker && (
+              <View style={styles.categoryPickerWrap}>
+                <View style={styles.categoryRow}>
+                  {(["skincare", "supplement", "haircare"] as const).map((cat) => (
+                    <Pressable
+                      key={cat}
+                      onPress={() => {
+                        setCategoryOverride(cat);
+                        setReAnalyzeError(null);
+                      }}
                       style={[
-                        styles.categoryOptionText,
-                        currentCategory === cat && styles.categoryOptionTextSelected,
+                        styles.categoryOption,
+                        currentCategory === cat && styles.categoryOptionSelected,
                       ]}
                     >
-                      {CATEGORY_LABELS[cat]}
-                    </Text>
-                  </Pressable>
-                ))}
+                      <Text
+                        style={[
+                          styles.categoryOptionText,
+                          currentCategory === cat && styles.categoryOptionTextSelected,
+                        ]}
+                      >
+                        {CATEGORY_LABELS[cat]}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </View>
               </View>
-            </View>
-          )}
+            )}
 
-          {pendingCategoryForReanalyze && (
-            <View style={styles.categoryReanalyzeWrap}>
-              <Pressable
-                onPress={handleReAnalyze}
-                disabled={reAnalyzing || !hasPendingForReanalyze}
-                style={[
-                  styles.reanalyzeButton,
-                  (reAnalyzing || !hasPendingForReanalyze) &&
-                    styles.reanalyzeButtonDisabled,
-                ]}
-              >
-                {reAnalyzing ? (
-                  <ActivityIndicator size="small" color="#fff" />
-                ) : (
-                  <Text style={styles.reanalyzeButtonText}>Re-analyze</Text>
+            {pendingCategoryForReanalyze && (
+              <View style={styles.categoryReanalyzeWrap}>
+                <Pressable
+                  onPress={handleReAnalyze}
+                  disabled={reAnalyzing || !hasPendingForReanalyze}
+                  style={[
+                    styles.reanalyzeButton,
+                    (reAnalyzing || !hasPendingForReanalyze) &&
+                      styles.reanalyzeButtonDisabled,
+                  ]}
+                >
+                  {reAnalyzing ? (
+                    <ActivityIndicator size="small" color="#fff" />
+                  ) : (
+                    <Text style={styles.reanalyzeButtonText}>Re-analyze</Text>
+                  )}
+                </Pressable>
+                {!hasPendingForReanalyze && (
+                  <Text style={styles.reanalyzeError}>
+                    Image expired, please scan again
+                  </Text>
                 )}
-              </Pressable>
-              {!hasPendingForReanalyze && (
-                <Text style={styles.reanalyzeError}>
-                  Image expired, please scan again
-                </Text>
-              )}
-              {reAnalyzeError && (
-                <Text style={styles.reanalyzeError}>{reAnalyzeError}</Text>
-              )}
+                {reAnalyzeError && (
+                  <Text style={styles.reanalyzeError}>{reAnalyzeError}</Text>
+                )}
+              </View>
+            )}
+          </View>
+        ) : (
+          <View style={styles.categoryTagSection}>
+            <View style={styles.tags}>
+              <SkeletonPill width={84} />
+              <SkeletonPill width={62} />
             </View>
-          )}
-        </View>
+          </View>
+        )}
 
         {/* Core tags — first module */}
-        {coreTags.length > 0 || safetyFormulaTag ? (
+        {revealStep >= 1 && (coreTags.length > 0 || safetyFormulaTag) ? (
           <View style={styles.coreTagsSection}>
             <View style={styles.tags}>
               {coreTags.map((tag, i) => {
@@ -1100,72 +1445,104 @@ export default function ReportScreen() {
               <FormulationDonut
                 chartData={chartData}
                 highlightSegmentIndex={highlightedDonutIndex}
+                loading={revealStep < 3}
               />
             </View>
           </>
         )}
 
         {/* Tabs below chart (or below unknown card when category is unknown) */}
-        <View style={styles.tabRow}>
-          <Pressable
-            onPress={() => setReportTab(0)}
-            style={[
-              styles.tabBtn,
-              reportTab === 0 && styles.tabBtnActive,
-            ]}
-          >
-            <Text
+        {revealStep >= 4 ? (
+          <View style={styles.tabRow}>
+            <Pressable
+              onPress={() => setReportTab(0)}
               style={[
-                styles.tabBtnText,
-                reportTab === 0 && styles.tabBtnTextActive,
+                styles.tabBtn,
+                reportTab === 0 && styles.tabBtnActive,
               ]}
             >
-              Overview
-            </Text>
-          </Pressable>
-          <Pressable
-            onPress={() => setReportTab(1)}
-            style={[
-              styles.tabBtn,
-              reportTab === 1 && styles.tabBtnActive,
-            ]}
-          >
-            <Text
+              <Text
+                style={[
+                  styles.tabBtnText,
+                  reportTab === 0 && styles.tabBtnTextActive,
+                ]}
+              >
+                Overview
+              </Text>
+            </Pressable>
+            <Pressable
+              onPress={() => setReportTab(1)}
               style={[
-                styles.tabBtnText,
-                reportTab === 1 && styles.tabBtnTextActive,
+                styles.tabBtn,
+                reportTab === 1 && styles.tabBtnActive,
               ]}
             >
-              Ingredients
-            </Text>
-          </Pressable>
-        </View>
+              <Text
+                style={[
+                  styles.tabBtnText,
+                  reportTab === 1 && styles.tabBtnTextActive,
+                ]}
+              >
+                Ingredients
+              </Text>
+            </Pressable>
+          </View>
+        ) : (
+          <View style={styles.tabRow}>
+            <SkeletonBlock height={46} style={{ flex: 1 }} />
+            <SkeletonBlock height={46} style={{ flex: 1 }} />
+          </View>
+        )}
 
         {reportTab === 0 && (
           <>
         {/* Summary */}
-        {summary.overallEvaluation?.trim() && (
+        {revealStep >= 2 ? (
+          summary.overallEvaluation?.trim() ? (
+            <View style={styles.sectionPlain}>
+              <Text style={[styles.cardLabel, { marginTop: 0 }]}>The Real Talk</Text>
+              <Text style={styles.cardText}>{summary.overallEvaluation}</Text>
+            </View>
+          ) : null
+        ) : (
           <View style={styles.sectionPlain}>
-            <Text style={[styles.cardLabel, { marginTop: 0 }]}>The Real Talk</Text>
-            <Text style={styles.cardText}>{summary.overallEvaluation}</Text>
+            <SkeletonLine width="86%" />
+            <SkeletonLine width="94%" style={{ marginTop: 10 }} />
+            <SkeletonLine width="72%" style={{ marginTop: 10 }} />
           </View>
         )}
 
-        {report.tips && report.tips.length > 0 && (
+        {revealStep >= 4 && adviceLines.length > 0 && (
           <>
             <Text style={styles.sectionTitle}>Must-Knows</Text>
             <View style={[styles.card, styles.tipsHighlight]}>
-              {report.tips.map((tip, i) => (
-                <View key={i} style={styles.bulletRow}>
-                  <Text style={styles.bulletEmoji}>ℹ️</Text>
-                  <Text style={styles.bulletText}>{tip}</Text>
-                </View>
-              ))}
+              {adviceLines.map((tip, i) => {
+                const aiLine = isAiResponseAdviceLine(tip);
+                return (
+                  <View
+                    key={i}
+                    style={[
+                      styles.bulletRow,
+                      aiLine && styles.aiResponseBulletRow,
+                    ]}
+                  >
+                    <Text style={styles.bulletEmoji}>ℹ️</Text>
+                    <Text
+                      style={[
+                        styles.bulletText,
+                        aiLine && styles.aiResponseBulletText,
+                      ]}
+                    >
+                      {tip}
+                    </Text>
+                  </View>
+                );
+              })}
             </View>
           </>
         )}
 
-        {summary.pros.length > 0 && (
+        {revealStep >= 4 && summary.pros.length > 0 && (
           <>
             <Text style={styles.sectionTitle}>The Wins</Text>
             <View style={styles.proHighlight}>
@@ -1183,7 +1560,7 @@ export default function ReportScreen() {
           </>
         )}
 
-        {showSuitabilityTop && (
+        {revealStep >= 5 && showSuitabilityTop && (
           <View style={styles.sectionPlain}>
             {hasBestFor && (
               <View
@@ -1257,11 +1634,16 @@ export default function ReportScreen() {
                   {label}
                 </Text>
                 {key === "absorption_rate" ? (
-                  <View style={[styles.card, styles.inlineScoreCard]}>
-                    <ScorePercentBar
-                      percent={dynamicDetails.absorption_rate ?? null}
-                    />
-                  </View>
+                  <>
+                    <Text style={styles.ingredientHint}>
+                      High absorption ensures nutrients reach your bloodstream, while low-grade forms often lead to digestive discomfort and poor results.
+                    </Text>
+                    <View style={[styles.card, styles.inlineScoreCard]}>
+                      <ScorePercentBar
+                        percent={dynamicDetails.absorption_rate ?? null}
+                      />
+                    </View>
+                  </>
                 ) : key === "greasiness" ? (
                   <View style={styles.greasinessGaugeWrap}>
                     <GreasinessGauge
@@ -1290,8 +1672,8 @@ export default function ReportScreen() {
           </View>
         )}
 
-        {synergy.length > 0 && (
-          <>
+        {revealStep >= 5 && synergy.length > 0 && (
+          <View>
             <Text style={styles.sectionTitle}>Power Pairs</Text>
             <Text style={styles.ingredientHint}>
               Our engine detected Power Pairs. These ingredients unlock enhanced
@@ -1307,10 +1689,10 @@ export default function ReportScreen() {
                 />
               ))}
             </View>
-          </>
+          </View>
         )}
 
-        {summary.cons.length > 0 && (
+        {revealStep >= 5 && summary.cons.length > 0 && (
           <>
             <Text style={styles.sectionTitle}>The Red Flags</Text>
             <View style={styles.consHighlight}>
@@ -1328,7 +1710,7 @@ export default function ReportScreen() {
           </>
         )}
 
-        {suitability.avoid_groups.length > 0 && (
+        {revealStep >= 5 && suitability.avoid_groups.length > 0 && (
           <View style={styles.sectionPlain}>
             <Text style={[styles.cardLabel, { marginTop: 0 }]}>Not For You If...</Text>
             <View style={styles.tags}>
@@ -1341,7 +1723,7 @@ export default function ReportScreen() {
           </View>
         )}
 
-        {showIrritationLevel && (
+        {revealStep >= 5 && showIrritationLevel && (
           <View style={styles.sectionPlain}>
             <View style={[styles.detailBlock, styles.blockLastInSection]}>
               <Text style={[styles.cardLabel, { marginTop: 0 }]}>
@@ -1356,8 +1738,8 @@ export default function ReportScreen() {
           </View>
         )}
 
-        {conflicts.length > 0 && (
-          <>
+        {revealStep >= 5 && conflicts.length > 0 && (
+          <View>
             <Text style={styles.sectionTitle}>Bad Mixes</Text>
             <Text style={styles.ingredientHint}>
               Our engine flags Bad Mixes. These specific actives clash on a
@@ -1379,128 +1761,211 @@ export default function ReportScreen() {
                 </View>
               </View>
             ))}
-          </>
+          </View>
         )}
           </>
         )}
 
         {reportTab === 1 && (
           <>
+            {/* Ingredients tab: not gated on revealStep — tabs unlock at step 4; step-5-only content caused permanent skeleton. */}
             {/* Safety score distribution (weighted by Major/Trace) */}
             {report.category !== "unknown" && safetyBinTotalWeight > 0 && (
-              <>
+              <View>
                 <Text style={styles.sectionTitle}>
                   Safety Score Distribution
                 </Text>
-                <View style={styles.card}>
-                  <SafetyScoreWeightedAreaLineChart
-                    binPercents={safetyBinPercents}
+                {isSafetyScoreUnlocked ? (
+                  <View style={styles.card}>
+                    <SafetyScoreWeightedAreaLineChart
+                      binPercents={safetyBinPercents}
+                    />
+                  </View>
+                ) : (
+                  <PaywallCard
+                    onUnlock={() => setSafetyScoreUnlocked(true)}
+                    title="Safety Score"
+                    body="Unlock the weighted distribution chart and per-ingredient safety scores."
+                    buttonText="$0.99 for 100% Safety"
                   />
-                </View>
-              </>
+                )}
+              </View>
             )}
 
             {hasSafetyAudit && (
               <>
                 <Text style={styles.sectionTitle}>Safety Audit</Text>
-                <View style={styles.proHighlight}>
-                  {!!safetyAudit?.formula_style?.trim() && (
-                    <View>
-                      <Text style={styles.safetyAuditSubTitle}>
-                        Formula Style
-                      </Text>
-                      <Text style={styles.safetyAuditSubText}>
-                        {safetyAudit.formula_style}
-                      </Text>
-                    </View>
-                  )}
-                  {!!safetyAudit?.safety_verdict?.trim() && (
-                    <View>
-                      <Text style={styles.safetyAuditSubTitle}>
-                        Safety Verdict
-                      </Text>
-                      <Text style={styles.safetyAuditSubText}>
-                        {safetyAudit.safety_verdict}
-                      </Text>
-                    </View>
-                  )}
-                  {!!safetyAudit?.unfiltered_risks?.trim() && (
-                    <View>
-                      <Text style={styles.safetyAuditSubTitle}>
-                        Why Lower Score
-                      </Text>
-                      <Text style={styles.safetyAuditSubText}>
-                        {safetyAudit.unfiltered_risks}
-                      </Text>
-                    </View>
-                  )}
-                </View>
+                {isSafetyAuditUnlocked ? (
+                  <View style={styles.proHighlight}>
+                    {!!safetyAudit?.formula_style?.trim() && (
+                      <View>
+                        <Text style={styles.safetyAuditSubTitle}>
+                          Formula Style
+                        </Text>
+                        <Text style={styles.safetyAuditSubText}>
+                          {safetyAudit.formula_style}
+                        </Text>
+                      </View>
+                    )}
+                    {!!safetyAudit?.safety_verdict?.trim() && (
+                      <View>
+                        <Text style={styles.safetyAuditSubTitle}>
+                          Safety Verdict
+                        </Text>
+                        <Text style={styles.safetyAuditSubText}>
+                          {safetyAudit.safety_verdict}
+                        </Text>
+                      </View>
+                    )}
+                    {!!safetyAudit?.unfiltered_risks?.trim() && (
+                      <View>
+                        <Text style={styles.safetyAuditSubTitle}>
+                          Why Lower Score
+                        </Text>
+                        <Text style={styles.safetyAuditSubText}>
+                          {safetyAudit.unfiltered_risks}
+                        </Text>
+                      </View>
+                    )}
+                  </View>
+                ) : (
+                  <PaywallCard onUnlock={() => setSafetyAuditUnlocked(true)} />
+                )}
               </>
             )}
 
-            <Text style={styles.sectionTitle}>Ingredients</Text>
-            {report.category !== "unknown" && (
-              <Text style={styles.ingredientHint}>
-                Our engine audits each ingredient by cross-referencing safety ratings and proven functions. We decode the formula to show you exactly what each component does and how it impacts your well-being.
-              </Text>
-            )}
-            <View style={styles.card}>
-              {report.ingredients.length === 0 ? (
-                <Text style={styles.cardText}>
-                  No ingredient breakdown available.
-                </Text>
-              ) : (
-                ingredientGroups.map((group, gi) => {
-                  const expanded = expandedIngredientGroups.has(gi);
-                  return (
-                    <View
-                      key={group.tag}
-                      style={[
-                        styles.ingredientGroupDrawer,
-                        gi > 0 && styles.ingredientGroupSpaced,
-                      ]}
-                    >
-                      <Pressable
-                        onPress={() => toggleIngredientGroup(gi)}
-                        style={styles.ingredientGroupHeader}
-                      >
-                        <Text style={styles.ingredientGroupTitle}>
-                          {group.tag}
-                        </Text>
-                        <Ionicons
-                          name={expanded ? "chevron-down" : "chevron-forward"}
-                          size={20}
-                          color={TEXT_SECONDARY}
-                        />
-                      </Pressable>
-                      {expanded && (
-                        <View style={styles.ingredientGroupContent}>
-                          {group.items.map((ing, ii) => (
-                            <IngredientCard
-                            key={`${group.tag}-${ing.name}-${ii}`}
-                            name={ing.name}
-                            feature_tag={ing.feature_tag}
-                            description={ing.description}
-                            is_major={ing.is_major}
-                            safetyScore={ing.safetyScore}
-                            hideFeatureTagBadge
-                            isLast={
-                              gi === ingredientGroups.length - 1 &&
-                              ii === group.items.length - 1
-                            }
-                          />
-                          ))}
-                        </View>
-                      )}
-                    </View>
-                  );
-                })
+            {!isSafetyScoreUnlocked &&
+              report.ingredients.length > 0 &&
+              (report.category === "unknown" || safetyBinTotalWeight <= 0) && (
+                <PaywallCard
+                  onUnlock={() => setSafetyScoreUnlocked(true)}
+                  title="Ingredient Safety Scores"
+                  body="Unlock numeric safety ratings for each ingredient in the list below."
+                  buttonText="Reveal scores"
+                />
               )}
+
+            <View>
+                <Text style={styles.sectionTitle}>Ingredients</Text>
+                {report.category !== "unknown" && (
+                  <Text style={styles.ingredientHint}>
+                    Our engine audits each ingredient by cross-referencing safety ratings and proven functions. We decode the formula to show you exactly what each component does and how it impacts your well-being.
+                  </Text>
+                )}
+                <View style={styles.card}>
+                  {report.ingredients.length === 0 ? (
+                    <Text style={styles.cardText}>
+                      No ingredient breakdown available.
+                    </Text>
+                  ) : (
+                    ingredientGroups.map((group, gi) => {
+                      const expanded = expandedIngredientGroups.has(gi);
+                      return (
+                        <View
+                          key={group.tag}
+                          style={[
+                            styles.ingredientGroupDrawer,
+                            gi > 0 && styles.ingredientGroupSpaced,
+                          ]}
+                        >
+                          <Pressable
+                            onPress={() => toggleIngredientGroup(gi)}
+                            style={styles.ingredientGroupHeader}
+                          >
+                            <Text style={styles.ingredientGroupTitle}>
+                              {group.tag}
+                            </Text>
+                            <Ionicons
+                              name={expanded ? "chevron-down" : "chevron-forward"}
+                              size={20}
+                              color={TEXT_SECONDARY}
+                            />
+                          </Pressable>
+                          {expanded && (
+                            <View style={styles.ingredientGroupContent}>
+                              {group.items.map((ing, ii) => (
+                                <IngredientCard
+                                key={`${group.tag}-${ing.name}-${ii}`}
+                                name={ing.name}
+                                feature_tag={ing.feature_tag}
+                                description={ing.description}
+                                is_major={ing.is_major}
+                                safetyScore={ing.safetyScore}
+                                showSafetyScore={isSafetyScoreUnlocked}
+                                hideFeatureTagBadge
+                                isLast={
+                                  gi === ingredientGroups.length - 1 &&
+                                  ii === group.items.length - 1
+                                }
+                              />
+                              ))}
+                            </View>
+                          )}
+                        </View>
+                      );
+                    })
+                  )}
+                </View>
             </View>
           </>
         )}
 
-        {/* AI Disclaimer - scroll to bottom, collapsible */}
+        <View style={styles.followUpSection}>
+          <Text style={styles.followUpSectionTitle}>Ask again</Text>
+          <View style={styles.followUpChips}>
+            <Pressable
+              onPress={() => void submitUserQuestion(CHIP_MISTAKE)}
+              disabled={reAnalyzing}
+              style={[
+                styles.followUpChip,
+                reAnalyzing && styles.followUpChipDisabled,
+              ]}
+            >
+              <Text style={styles.followUpChipText}>🔍Wrong Detect？</Text>
+            </Pressable>
+            <Pressable
+              onPress={() => void submitUserQuestion(CHIP_PREGNANCY)}
+              disabled={reAnalyzing}
+              style={[
+                styles.followUpChip,
+                reAnalyzing && styles.followUpChipDisabled,
+              ]}
+            >
+              <Text style={styles.followUpChipText}>🤰 Can I use it when pregnant？</Text>
+            </Pressable>
+          </View>
+          <View style={styles.followUpInputRow}>
+            <TextInput
+              style={[
+                styles.followUpInput,
+                reAnalyzing && styles.followUpInputDisabled,
+              ]}
+              value={followUpInput}
+              onChangeText={setFollowUpInput}
+              placeholder="AI generate answer is not medical advice. Consult a professional for skin or health concerns."
+              placeholderTextColor={TEXT_MUTED}
+              editable={!reAnalyzing}
+              multiline
+            />
+            <Pressable
+              onPress={() => void submitUserQuestion(followUpInput)}
+              disabled={reAnalyzing || !followUpInput.trim()}
+              style={[
+                styles.followUpSendBtn,
+                (reAnalyzing || !followUpInput.trim()) &&
+                  styles.followUpSendBtnDisabled,
+              ]}
+            >
+              {reAnalyzing ? (
+                <ActivityIndicator size="small" color="#fff" />
+              ) : (
+                <Text style={styles.followUpSendBtnText}>Send</Text>
+              )}
+            </Pressable>
+          </View>
+        </View>
+
+        {/* AI Disclaimer — pinned to bottom of scroll content */}
         <View style={styles.disclaimerDrawer}>
           <Pressable
             onPress={() => setDisclaimerExpanded((v) => !v)}
@@ -1531,10 +1996,6 @@ export default function ReportScreen() {
             </View>
           )}
         </View>
-
-        <Pressable disabled style={styles.reportMistakesBtn}>
-          <Text style={styles.reportMistakesBtnText}>Report mistakes</Text>
-        </Pressable>
       </ScrollView>
     </View>
   );
@@ -1543,6 +2004,10 @@ export default function ReportScreen() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
+  },
+  loadingOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: BG,
   },
   scroll: {
     flex: 1,
@@ -1582,7 +2047,7 @@ const styles = StyleSheet.create({
   },
   disclaimerDrawer: {
     marginTop: MODULE_GAP,
-    marginBottom: 48,
+    marginBottom: 0,
     backgroundColor: CARD_BG,
     borderRadius: 12,
     borderWidth: 1,
@@ -1610,18 +2075,6 @@ const styles = StyleSheet.create({
     lineHeight: 22,
     marginBottom: 14,
   },
-  reportMistakesBtn: {
-    alignSelf: "center",
-    paddingVertical: 4,
-    paddingHorizontal: 4,
-    marginTop: -20,
-    marginBottom: 8,
-  },
-  reportMistakesBtnText: {
-    color: TEXT_MUTED,
-    fontSize: 12,
-    fontWeight: "500",
-  },
   backButton: {
     flexDirection: "row",
     alignItems: "center",
@@ -1642,6 +2095,21 @@ const styles = StyleSheet.create({
     color: TEXT_MUTED,
     fontSize: 16,
     marginBottom: 16,
+    textAlign: "center",
+  },
+  retryButton: {
+    paddingVertical: 10,
+    paddingHorizontal: 18,
+    borderRadius: 8,
+    backgroundColor: THEME_SOFT,
+    borderWidth: 1,
+    borderColor: THEME_BORDER_STRONG,
+    marginBottom: 12,
+  },
+  retryButtonText: {
+    color: THEME,
+    fontSize: 14,
+    fontWeight: "600",
   },
   alertEmoji: {
     fontSize: 28,
@@ -1782,6 +2250,90 @@ const styles = StyleSheet.create({
   tipsHighlight: {
     backgroundColor: "rgba(251, 191, 36, 0.1)",
     borderColor: "rgba(251, 191, 36, 0.25)",
+  },
+  aiResponseBulletRow: {
+    backgroundColor: "#FFF9C4",
+    borderRadius: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    marginLeft: -4,
+  },
+  aiResponseBulletText: {
+    fontWeight: "700",
+  },
+  followUpSection: {
+    marginTop: MODULE_GAP,
+    marginBottom: MODULE_GAP,
+    alignSelf: "stretch",
+  },
+  followUpSectionTitle: {
+    color: THEME,
+    fontSize: MODULE_TITLE_SIZE,
+    fontWeight: "600",
+    marginBottom: MODULE_TITLE_TO_BODY,
+  },
+  followUpChips: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 10,
+    marginBottom: 14,
+  },
+  followUpChip: {
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 999,
+    backgroundColor: THEME_SOFT,
+    borderWidth: 1,
+    borderColor: THEME_BORDER_STRONG,
+  },
+  followUpChipDisabled: {
+    opacity: 0.5,
+  },
+  followUpChipText: {
+    color: THEME,
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  followUpInputRow: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    gap: 10,
+  },
+  followUpInput: {
+    flex: 1,
+    minHeight: 44,
+    maxHeight: 120,
+    marginTop: 0,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: THEME_BORDER_STRONG,
+    backgroundColor: CARD_BG,
+    color: TEXT_PRIMARY,
+    fontSize: 15,
+  },
+  followUpInputDisabled: {
+    opacity: 0.55,
+    backgroundColor: CARD_BORDER,
+  },
+  followUpSendBtn: {
+    paddingVertical: 12,
+    paddingHorizontal: 18,
+    borderRadius: 12,
+    backgroundColor: THEME,
+    minWidth: 72,
+    alignItems: "center",
+    justifyContent: "center",
+    minHeight: 44,
+  },
+  followUpSendBtnDisabled: {
+    opacity: 0.5,
+  },
+  followUpSendBtnText: {
+    color: "#fff",
+    fontSize: 15,
+    fontWeight: "700",
   },
   coreTagsSection: {
     marginBottom: MODULE_GAP,

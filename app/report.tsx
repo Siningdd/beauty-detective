@@ -2,6 +2,7 @@ import {
   View,
   Text,
   StyleSheet,
+  type ViewStyle,
   ScrollView,
   Pressable,
   ActivityIndicator,
@@ -13,15 +14,17 @@ import {
 } from "react-native";
 import { useRouter } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import { LinearGradient } from "expo-linear-gradient";
 import Svg, { Circle, Path, Text as SvgText } from "react-native-svg";
 import {
+  getActiveAnalysisSessionId,
   getAnalysisParams,
   clearAnalysisParams,
   getPendingImage,
   getLastAnalyzedImage,
   getReport,
+  getReportMeta,
   setReport,
   setLastAnalyzedImage,
   clearPendingImage,
@@ -29,8 +32,15 @@ import {
 } from "../services/store";
 import { analyzeImage } from "../services/api";
 import {
+  buildFallbackStreamTokens,
   detectOcrAndHints,
+  extractHighlightKeywords,
+  extractRawTextFast,
+  extractRawTextLate,
+  mergeOcrStreamTokens,
   resolveHintDecision,
+  tokenizeOcrStream,
+  type OcrStreamToken,
 } from "../services/ocrDetect";
 import type {
   AnalysisIngredient,
@@ -41,7 +51,7 @@ import type {
   GreasinessLevel,
   SkinTypeToken,
 } from "../types/analysis";
-import { IngredientCard } from "../components/IngredientCard";
+import { IngredientSection } from "../components/IngredientSection";
 import { GreasinessGauge } from "../components/GreasinessGauge";
 import { SynergyProductCard } from "../components/SynergyProductCard";
 import { LoadingScreen } from "../components/LoadingScreen";
@@ -105,6 +115,56 @@ function getExpertAdviceLines(r: AnalysisResult): string[] {
 
 function isAiResponseAdviceLine(text: string): boolean {
   return text.trimStart().startsWith(AI_RESPONSE_PREFIX);
+}
+
+const MAX_REVEAL_STEP = 5;
+const CHAT_STORAGE_PREFIX = "chat_";
+
+function suffixPrefixSplit(
+  current: string[],
+  oldLines: string[]
+): number | null {
+  if (oldLines.length === 0) {
+    if (current.length === 0) return 0;
+    return null;
+  }
+  if (current.length < oldLines.length) return null;
+  const start = current.length - oldLines.length;
+  for (let j = 0; j < oldLines.length; j++) {
+    if (current[start + j] !== oldLines[j]) return null;
+  }
+  return start;
+}
+
+function prependUniqueOrdered(newItems: string[], prev: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const line of newItems) {
+    if (seen.has(line)) continue;
+    seen.add(line);
+    out.push(line);
+  }
+  for (const line of prev) {
+    if (seen.has(line)) continue;
+    seen.add(line);
+    out.push(line);
+  }
+  return out;
+}
+
+function extractNewAdviceLines(
+  currentLines: string[],
+  oldLines: string[]
+): string[] {
+  const start = suffixPrefixSplit(currentLines, oldLines);
+  if (start !== null) {
+    const prefix = currentLines.slice(0, start);
+    if (prefix.length > 0) return prefix;
+  }
+  const aiOnly = currentLines.filter((line) => isAiResponseAdviceLine(line));
+  if (aiOnly.length > 0) return prependUniqueOrdered(aiOnly, []);
+  if (currentLines.length > 0) return [currentLines[0]];
+  return [];
 }
 
 const GREASINESS_LABELS: Record<
@@ -828,9 +888,36 @@ export default function ReportScreen() {
   const [expandedIngredientGroups, setExpandedIngredientGroups] = useState<
     Set<number>
   >(() => new Set([0]));
+  const [chatHistory, setChatHistory] = useState<string[]>([]);
+  const lastLinesRef = useRef<string[]>([]);
+  const threadAnchorRef = useRef<{ sessionId: number; base64: string } | null>(
+    null
+  );
+  const chatSessionForStorageRef = useRef<number | null>(null);
   const [highlightedDonutIndex, setHighlightedDonutIndex] = useState<
     number | null
   >(null);
+  const [loadingStreamTokens, setLoadingStreamTokens] = useState<OcrStreamToken[]>([]);
+  const [loadingHighlightKeywords, setLoadingHighlightKeywords] = useState<string[]>([]);
+  const [loadingBackgroundUri, setLoadingBackgroundUri] = useState<string | undefined>(undefined);
+  const [loadingGotResult, setLoadingGotResult] = useState(false);
+  const [allDetectedTokens, setAllDetectedTokens] = useState<string[]>([]);
+  const [loadingHasData, setLoadingHasData] = useState(false);
+  const loadingRawPreviewRef = useRef("");
+  const pendingLoadingReportRef = useRef<{
+    result: AnalysisResult;
+    base64: string;
+    mimeType: string;
+    ingredientText?: string;
+  } | null>(null);
+  const commitLoadingSuccessRef = useRef<
+    (payload: {
+      result: AnalysisResult;
+      base64: string;
+      mimeType: string;
+      ingredientText?: string;
+    }) => void
+  >(() => {});
 
   const clearRevealTimers = () => {
     revealTimersRef.current.forEach((timer) => clearTimeout(timer));
@@ -848,60 +935,270 @@ export default function ReportScreen() {
     });
   };
 
+  const buildDetectedTokenPool = (rawText: string): string[] => {
+    const words = String(rawText ?? "")
+      .replace(/\s+/g, " ")
+      .split(/[\s,;:|/\\]+/)
+      .map((token) => token.trim())
+      .filter((token) => token.length > 0);
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const word of words) {
+      const key = word.toUpperCase();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push(word);
+      if (out.length >= 240) break;
+    }
+    return out;
+  };
+
+  const commitLoadingSuccess = (payload: {
+    result: AnalysisResult;
+    base64: string;
+    mimeType: string;
+    ingredientText?: string;
+  }) => {
+    setReportState(payload.result);
+    beginRevealSequence();
+    setSafetyAuditUnlocked(false);
+    setSafetyScoreUnlocked(false);
+    const initialLines = getExpertAdviceLines(payload.result);
+    setChatHistory(initialLines);
+    lastLinesRef.current = initialLines;
+    const sid = getActiveAnalysisSessionId();
+    chatSessionForStorageRef.current = sid;
+    threadAnchorRef.current = { sessionId: sid, base64: payload.base64 };
+    try {
+      if (typeof sessionStorage !== "undefined") {
+        sessionStorage.removeItem(`${CHAT_STORAGE_PREFIX}${sid}`);
+      }
+    } catch {
+      /* ignore */
+    }
+    setLastAnalyzedImage({
+      uri: getPendingImage()?.uri ?? "",
+      base64: payload.base64,
+      mimeType: payload.mimeType,
+      ingredientText: payload.ingredientText,
+    });
+    if (payload.result.category !== "unknown") {
+      clearPendingImage();
+    }
+    clearAnalysisParams();
+    pendingLoadingReportRef.current = null;
+    setLoadingGotResult(false);
+    setLoadingInitial(false);
+  };
+  commitLoadingSuccessRef.current = commitLoadingSuccess;
+
+  const handleLoadingFadeComplete = useCallback(() => {
+    const pending = pendingLoadingReportRef.current;
+    if (!pending) return;
+    commitLoadingSuccessRef.current(pending);
+  }, []);
+
+  const kickOffLoadingFirstPass = (params: PendingAnalysisParams, signal: AbortSignal) => {
+    const fallbackTokens = buildFallbackStreamTokens();
+    setLoadingStreamTokens([]);
+    setLoadingHighlightKeywords([]);
+    setLoadingBackgroundUri(undefined);
+    setAllDetectedTokens([]);
+    setLoadingHasData(false);
+    loadingRawPreviewRef.current = "";
+    const pending = getPendingImage();
+    setLoadingBackgroundUri(pending?.uri || undefined);
+    const ocrOptions = {
+      uri: pending?.uri,
+      base64: params.base64,
+    };
+    let appliedRealTokens = false;
+    const applyRawTokens = (raw: string) => {
+      if (signal.aborted) return;
+      if (!raw.trim()) return;
+      loadingRawPreviewRef.current = raw;
+      const pool = buildDetectedTokenPool(raw);
+      if (pool.length > 0) {
+        setAllDetectedTokens(pool);
+        setLoadingHasData(true);
+      }
+      const liveTokens = tokenizeOcrStream(raw);
+      if (liveTokens.length === 0) return;
+      appliedRealTokens = true;
+      setLoadingStreamTokens(
+        mergeOcrStreamTokens({
+          primary: liveTokens,
+          secondary: fallbackTokens,
+          limit: 120,
+        })
+      );
+      setLoadingHighlightKeywords(
+        extractHighlightKeywords({
+          rawText: raw,
+          limit: 18,
+        })
+      );
+    };
+    void extractRawTextFast(ocrOptions, 750).then((raw) => {
+      applyRawTokens(raw);
+    });
+    void extractRawTextLate(ocrOptions, 5000).then((raw) => {
+      if (appliedRealTokens) return;
+      applyRawTokens(raw);
+    });
+  };
+
+  const applyResolvedIngredientToLoading = (ingredientText?: string) => {
+    const text = ingredientText?.trim() ?? "";
+    if (!text) return;
+    const prevRaw = loadingRawPreviewRef.current;
+    loadingRawPreviewRef.current = text;
+    const pool = buildDetectedTokenPool(text);
+    if (pool.length > 0) {
+      setAllDetectedTokens(pool);
+      setLoadingHasData(true);
+    }
+    const liveTokens = tokenizeOcrStream(text);
+    if (liveTokens.length > 0) {
+      setLoadingStreamTokens(
+        mergeOcrStreamTokens({
+          primary: liveTokens,
+          secondary: buildFallbackStreamTokens(),
+          limit: 120,
+        })
+      );
+    }
+    setLoadingHighlightKeywords(
+      extractHighlightKeywords({
+        correctedText: text,
+        rawText: prevRaw || text,
+        limit: 18,
+      })
+    );
+  };
+
   useEffect(() => {
     const params = getAnalysisParams();
     if (!params) {
       const cached = getReport();
-      if (cached) {
+      const cachedMeta = getReportMeta();
+      if (
+        cached &&
+        cachedMeta &&
+        cachedMeta.sessionId === getActiveAnalysisSessionId()
+      ) {
         setReportState(cached);
         beginRevealSequence();
         setSafetyAuditUnlocked(false);
         setSafetyScoreUnlocked(false);
+        const sid = cachedMeta.sessionId;
+        chatSessionForStorageRef.current = sid;
+        const baseline = getExpertAdviceLines(cached);
+        lastLinesRef.current = baseline;
+        const img = getLastAnalyzedImage();
+        if (img?.base64 && img.sessionId === sid) {
+          threadAnchorRef.current = {
+            sessionId: img.sessionId,
+            base64: img.base64,
+          };
+        } else {
+          threadAnchorRef.current = null;
+        }
+        let restored = false;
+        try {
+          if (typeof sessionStorage !== "undefined") {
+            const raw = sessionStorage.getItem(`${CHAT_STORAGE_PREFIX}${sid}`);
+            if (raw) {
+              const parsed = JSON.parse(raw) as unknown;
+              if (
+                Array.isArray(parsed) &&
+                parsed.every((x) => typeof x === "string")
+              ) {
+                setChatHistory(parsed.map(String).filter(Boolean));
+                restored = true;
+              }
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+        if (!restored) setChatHistory(baseline);
       }
       return;
     }
     controllerRef.current.abort();
     controllerRef.current = new AbortController();
     const { signal } = controllerRef.current;
+    pendingLoadingReportRef.current = null;
+    setLoadingGotResult(false);
+    setAllDetectedTokens([]);
+    setLoadingHasData(false);
     setLoadingInitial(true);
     setInitialError(null);
+    kickOffLoadingFirstPass(params, signal);
     enrichAnalysisParamsIfNeeded(params, signal)
-      .then((resolved) =>
-        analyzeImage(
+      .then((resolved) => {
+        applyResolvedIngredientToLoading(resolved.ingredientText);
+        return analyzeImage(
           resolved.base64,
           resolved.mimeType,
           signal,
           resolved.categoryHint,
           resolved.thinkingHint,
           resolved.ingredientText
-        ).then((result) => ({ result, resolved }))
-      )
+        ).then((result) => ({ result, resolved }));
+      })
       .then((result) => {
         if (signal.aborted) return;
-        setReport(result.result);
-        setReportState(result.result);
-        beginRevealSequence();
-        setSafetyAuditUnlocked(false);
-        setSafetyScoreUnlocked(false);
-        setLastAnalyzedImage({
-          uri: getPendingImage()?.uri ?? "",
-          base64: params.base64,
-          mimeType: params.mimeType,
-          ingredientText: result.resolved.ingredientText,
+        setReport(result.result, {
+          sessionId: result.resolved.sessionId,
+          isFollowUpResponse: false,
         });
-        if (result.result.category !== "unknown") {
-          clearPendingImage();
-        }
-        clearAnalysisParams();
+        pendingLoadingReportRef.current = {
+          result: result.result,
+          base64: result.resolved.base64,
+          mimeType: result.resolved.mimeType,
+          ingredientText: result.resolved.ingredientText,
+        };
+        setLoadingGotResult(true);
       })
       .catch((e) => {
         if (e instanceof Error && e.name === "AbortError") return;
+        pendingLoadingReportRef.current = null;
+        setLoadingGotResult(false);
         setInitialError(e instanceof Error ? e.message : "Analysis failed");
       })
       .finally(() => {
-        if (!signal.aborted) setLoadingInitial(false);
+        if (signal.aborted) return;
+        if (!pendingLoadingReportRef.current) {
+          setLoadingInitial(false);
+        }
       });
   }, []);
+
+  useEffect(() => {
+    const sid = chatSessionForStorageRef.current;
+    if (chatHistory.length === 0 || sid == null) return;
+    if (sid !== getActiveAnalysisSessionId()) return;
+    try {
+      if (typeof sessionStorage !== "undefined") {
+        sessionStorage.setItem(
+          `${CHAT_STORAGE_PREFIX}${sid}`,
+          JSON.stringify(chatHistory)
+        );
+      }
+    } catch {
+      /* ignore */
+    }
+  }, [chatHistory]);
+
+  const ingredientGroups = useMemo(() => {
+    if (!report) return [];
+    return groupIngredientsByFeatureTag(
+      report.ingredients,
+      report.chartData ?? []
+    );
+  }, [report?.ingredients, report?.chartData]);
 
   const submitUserQuestion = async (rawQuestion: string) => {
     if (!report || reAnalyzing) return;
@@ -920,8 +1217,6 @@ export default function ReportScreen() {
     const { signal } = controllerRef.current;
     setReAnalyzeError(null);
     setReAnalyzing(true);
-    clearRevealTimers();
-    setRevealStep(0);
     const cat = categoryOverride ?? report.category;
     const categoryHint =
       cat === "unknown" ? undefined : cat;
@@ -929,6 +1224,32 @@ export default function ReportScreen() {
       cat === "supplement" ? ("supplement" as const) : undefined;
     const ingredientText = imageForAsk.ingredientText?.trim() || undefined;
     try {
+      const followUpSessionId = imageForAsk.sessionId;
+      const anchor = threadAnchorRef.current;
+      const threadMismatch =
+        anchor != null &&
+        (imageForAsk.sessionId !== anchor.sessionId ||
+          imageForAsk.base64 !== anchor.base64);
+      if (threadMismatch) {
+        const baseline = getExpertAdviceLines(report);
+        setChatHistory(baseline);
+        lastLinesRef.current = baseline;
+        try {
+          if (typeof sessionStorage !== "undefined") {
+            sessionStorage.removeItem(
+              `${CHAT_STORAGE_PREFIX}${getActiveAnalysisSessionId()}`
+            );
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+      if (anchor == null || threadMismatch) {
+        threadAnchorRef.current = {
+          sessionId: imageForAsk.sessionId,
+          base64: imageForAsk.base64,
+        };
+      }
       const newData = await analyzeImage(
         imageForAsk.base64,
         imageForAsk.mimeType,
@@ -939,11 +1260,30 @@ export default function ReportScreen() {
         userQuestion
       );
       if (signal.aborted) return;
-      setReport(newData);
-      setReportState(newData);
-      beginRevealSequence();
-      setSafetyAuditUnlocked(false);
-      setSafetyScoreUnlocked(false);
+      const currentLines = getExpertAdviceLines(newData);
+      const newItems = extractNewAdviceLines(currentLines, lastLinesRef.current);
+      setChatHistory((prev) => prependUniqueOrdered(newItems, prev));
+      lastLinesRef.current = currentLines;
+      threadAnchorRef.current = {
+        sessionId: imageForAsk.sessionId,
+        base64: imageForAsk.base64,
+      };
+      setReportState((prev) => {
+        const next =
+          prev != null
+            ? {
+                ...newData,
+                ingredients: prev.ingredients,
+                chartData: prev.chartData,
+              }
+            : newData;
+        setReport(next, {
+          sessionId: followUpSessionId,
+          isFollowUpResponse: true,
+        });
+        return next;
+      });
+      setRevealStep(MAX_REVEAL_STEP);
       setFollowUpInput("");
       if (newData.category !== "unknown") {
         clearPendingImage();
@@ -986,8 +1326,28 @@ export default function ReportScreen() {
         targetCategory,
         reAnalyzeThinkingHint
       );
-      setReport(newReport);
+      setReport(newReport, {
+        sessionId: imageForReanalyze.sessionId,
+        isFollowUpResponse: false,
+      });
       setReportState(newReport);
+      const reLines = getExpertAdviceLines(newReport);
+      setChatHistory(reLines);
+      lastLinesRef.current = reLines;
+      chatSessionForStorageRef.current = imageForReanalyze.sessionId;
+      threadAnchorRef.current = {
+        sessionId: imageForReanalyze.sessionId,
+        base64: imageForReanalyze.base64,
+      };
+      try {
+        if (typeof sessionStorage !== "undefined") {
+          sessionStorage.removeItem(
+            `${CHAT_STORAGE_PREFIX}${imageForReanalyze.sessionId}`
+          );
+        }
+      } catch {
+        /* ignore */
+      }
       beginRevealSequence();
       setSafetyAuditUnlocked(false);
       setSafetyScoreUnlocked(false);
@@ -1010,12 +1370,18 @@ export default function ReportScreen() {
     controllerRef.current.abort();
     controllerRef.current = new AbortController();
     const { signal } = controllerRef.current;
+    pendingLoadingReportRef.current = null;
+    setLoadingGotResult(false);
+    setAllDetectedTokens([]);
+    setLoadingHasData(false);
     setInitialError(null);
     setLoadingInitial(true);
     clearRevealTimers();
     setRevealStep(0);
+    kickOffLoadingFirstPass(params, signal);
     try {
       const resolved = await enrichAnalysisParamsIfNeeded(params, signal);
+      applyResolvedIngredientToLoading(resolved.ingredientText);
       const result = await analyzeImage(
         resolved.base64,
         resolved.mimeType,
@@ -1025,26 +1391,27 @@ export default function ReportScreen() {
         resolved.ingredientText
       );
       if (signal.aborted) return;
-      setReport(result);
-      setReportState(result);
-      beginRevealSequence();
-      setSafetyAuditUnlocked(false);
-      setSafetyScoreUnlocked(false);
-      setLastAnalyzedImage({
-        uri: getPendingImage()?.uri ?? "",
-        base64: params.base64,
-        mimeType: params.mimeType,
-        ingredientText: resolved.ingredientText,
+      setReport(result, {
+        sessionId: resolved.sessionId,
+        isFollowUpResponse: false,
       });
-      if (result.category !== "unknown") {
-        clearPendingImage();
-      }
-      clearAnalysisParams();
+      pendingLoadingReportRef.current = {
+        result,
+        base64: resolved.base64,
+        mimeType: resolved.mimeType,
+        ingredientText: resolved.ingredientText,
+      };
+      setLoadingGotResult(true);
     } catch (e) {
       if (e instanceof Error && e.name === "AbortError") return;
+      pendingLoadingReportRef.current = null;
+      setLoadingGotResult(false);
       setInitialError(e instanceof Error ? e.message : "Analysis failed");
     } finally {
-      if (!signal.aborted) setLoadingInitial(false);
+      if (signal.aborted) return;
+      if (!pendingLoadingReportRef.current) {
+        setLoadingInitial(false);
+      }
     }
   };
 
@@ -1089,7 +1456,19 @@ export default function ReportScreen() {
             </View>
           </ScrollView>
           <View style={styles.loadingOverlay}>
-            <LoadingScreen onCancel={() => controllerRef.current.abort()} />
+            <LoadingScreen
+              key={`loading-${getAnalysisParams()?.sessionId ?? getActiveAnalysisSessionId()}`}
+              {...({
+                onCancel: () => controllerRef.current.abort(),
+                gotResult: loadingGotResult,
+                onFadeComplete: handleLoadingFadeComplete,
+                streamTokens: loadingStreamTokens,
+                allDetectedTokens,
+                hasData: loadingHasData,
+                highlightKeywords: loadingHighlightKeywords,
+                backgroundImageUri: loadingBackgroundUri,
+              } as any)}
+            />
           </View>
         </View>
       );
@@ -1150,11 +1529,6 @@ export default function ReportScreen() {
   };
 
   const chartData = report.chartData ?? [];
-  const adviceLines = getExpertAdviceLines(report);
-  const ingredientGroups = groupIngredientsByFeatureTag(
-    report.ingredients,
-    chartData
-  );
 
   const { totalWeight: safetyBinTotalWeight, binPercents: safetyBinPercents } =
     computeSafetyScoreWeightedBinPercents(report.ingredients);
@@ -1246,11 +1620,73 @@ export default function ReportScreen() {
         ? "🤯 overload formula"
         : "";
 
+  const askPanel = (
+    <View style={styles.followUpSection}>
+      <Text style={styles.followUpSectionTitle}>🙋 Ask Me Anything</Text>
+      <View style={styles.followUpChips}>
+        <Pressable
+          onPress={() => void submitUserQuestion(CHIP_MISTAKE)}
+          disabled={reAnalyzing}
+          style={[
+            styles.followUpChip,
+            reAnalyzing && styles.followUpChipDisabled,
+          ]}
+        >
+          <Text style={styles.followUpChipText}>🔍Wrong Detect？</Text>
+        </Pressable>
+        <Pressable
+          onPress={() => void submitUserQuestion(CHIP_PREGNANCY)}
+          disabled={reAnalyzing}
+          style={[
+            styles.followUpChip,
+            reAnalyzing && styles.followUpChipDisabled,
+          ]}
+        >
+          <Text style={styles.followUpChipText}>
+            🤰 Can I use it when pregnant？
+          </Text>
+        </Pressable>
+      </View>
+      <View style={styles.followUpInputRow}>
+        <TextInput
+          style={[
+            styles.followUpInput,
+            reAnalyzing && styles.followUpInputDisabled,
+          ]}
+          value={followUpInput}
+          onChangeText={setFollowUpInput}
+          placeholder="AI generate answer is not medical advice. Consult a professional for skin or health concerns."
+          placeholderTextColor={TEXT_MUTED}
+          editable={!reAnalyzing}
+          multiline
+        />
+        <Pressable
+          onPress={() => void submitUserQuestion(followUpInput)}
+          disabled={reAnalyzing || !followUpInput.trim()}
+          style={[
+            styles.followUpSendBtn,
+            (reAnalyzing || !followUpInput.trim()) &&
+              styles.followUpSendBtnDisabled,
+          ]}
+        >
+          {reAnalyzing ? (
+            <ActivityIndicator size="small" color="#fff" />
+          ) : (
+            <Text style={styles.followUpSendBtnText}>Send</Text>
+          )}
+        </Pressable>
+      </View>
+    </View>
+  );
+
   return (
     <View style={[styles.container, { backgroundColor: BG }]}>
       <ScrollView
         style={styles.scroll}
-        contentContainerStyle={styles.scrollContent}
+        contentContainerStyle={[
+          styles.scrollContent,
+          Platform.OS === "web" ? { paddingBottom: 150 } : null,
+        ]}
         showsVerticalScrollIndicator={false}
       >
         <Pressable onPress={() => router.back()} style={styles.backButton}>
@@ -1512,15 +1948,15 @@ export default function ReportScreen() {
           </View>
         )}
 
-        {revealStep >= 4 && adviceLines.length > 0 && (
+        {revealStep >= 4 && chatHistory.length > 0 && (
           <>
             <Text style={styles.sectionTitle}>Must-Knows</Text>
             <View style={[styles.card, styles.tipsHighlight]}>
-              {adviceLines.map((tip, i) => {
+              {chatHistory.map((tip, i) => {
                 const aiLine = isAiResponseAdviceLine(tip);
                 return (
                   <View
-                    key={i}
+                    key={`${i}-${tip.slice(0, 24)}`}
                     style={[
                       styles.bulletRow,
                       aiLine && styles.aiResponseBulletRow,
@@ -1845,125 +2281,28 @@ export default function ReportScreen() {
                 />
               )}
 
-            <View>
-                <Text style={styles.sectionTitle}>Ingredients</Text>
-                {report.category !== "unknown" && (
-                  <Text style={styles.ingredientHint}>
-                    Our engine audits each ingredient by cross-referencing safety ratings and proven functions. We decode the formula to show you exactly what each component does and how it impacts your well-being.
-                  </Text>
-                )}
-                <View style={styles.card}>
-                  {report.ingredients.length === 0 ? (
-                    <Text style={styles.cardText}>
-                      No ingredient breakdown available.
-                    </Text>
-                  ) : (
-                    ingredientGroups.map((group, gi) => {
-                      const expanded = expandedIngredientGroups.has(gi);
-                      return (
-                        <View
-                          key={group.tag}
-                          style={[
-                            styles.ingredientGroupDrawer,
-                            gi > 0 && styles.ingredientGroupSpaced,
-                          ]}
-                        >
-                          <Pressable
-                            onPress={() => toggleIngredientGroup(gi)}
-                            style={styles.ingredientGroupHeader}
-                          >
-                            <Text style={styles.ingredientGroupTitle}>
-                              {group.tag}
-                            </Text>
-                            <Ionicons
-                              name={expanded ? "chevron-down" : "chevron-forward"}
-                              size={20}
-                              color={TEXT_SECONDARY}
-                            />
-                          </Pressable>
-                          {expanded && (
-                            <View style={styles.ingredientGroupContent}>
-                              {group.items.map((ing, ii) => (
-                                <IngredientCard
-                                key={`${group.tag}-${ing.name}-${ii}`}
-                                name={ing.name}
-                                feature_tag={ing.feature_tag}
-                                description={ing.description}
-                                is_major={ing.is_major}
-                                safetyScore={ing.safetyScore}
-                                showSafetyScore={isSafetyScoreUnlocked}
-                                hideFeatureTagBadge
-                                isLast={
-                                  gi === ingredientGroups.length - 1 &&
-                                  ii === group.items.length - 1
-                                }
-                              />
-                              ))}
-                            </View>
-                          )}
-                        </View>
-                      );
-                    })
-                  )}
-                </View>
-            </View>
+            <IngredientSection
+              category={report.category}
+              ingredientGroups={ingredientGroups}
+              expandedIngredientGroups={expandedIngredientGroups}
+              onToggleGroup={toggleIngredientGroup}
+              isSafetyScoreUnlocked={isSafetyScoreUnlocked}
+              styles={{
+                sectionTitle: styles.sectionTitle,
+                ingredientHint: styles.ingredientHint,
+                card: styles.card,
+                cardText: styles.cardText,
+                ingredientGroupDrawer: styles.ingredientGroupDrawer,
+                ingredientGroupSpaced: styles.ingredientGroupSpaced,
+                ingredientGroupHeader: styles.ingredientGroupHeader,
+                ingredientGroupTitle: styles.ingredientGroupTitle,
+                ingredientGroupContent: styles.ingredientGroupContent,
+              }}
+            />
           </>
         )}
 
-        <View style={styles.followUpSection}>
-          <Text style={styles.followUpSectionTitle}>Ask again</Text>
-          <View style={styles.followUpChips}>
-            <Pressable
-              onPress={() => void submitUserQuestion(CHIP_MISTAKE)}
-              disabled={reAnalyzing}
-              style={[
-                styles.followUpChip,
-                reAnalyzing && styles.followUpChipDisabled,
-              ]}
-            >
-              <Text style={styles.followUpChipText}>🔍Wrong Detect？</Text>
-            </Pressable>
-            <Pressable
-              onPress={() => void submitUserQuestion(CHIP_PREGNANCY)}
-              disabled={reAnalyzing}
-              style={[
-                styles.followUpChip,
-                reAnalyzing && styles.followUpChipDisabled,
-              ]}
-            >
-              <Text style={styles.followUpChipText}>🤰 Can I use it when pregnant？</Text>
-            </Pressable>
-          </View>
-          <View style={styles.followUpInputRow}>
-            <TextInput
-              style={[
-                styles.followUpInput,
-                reAnalyzing && styles.followUpInputDisabled,
-              ]}
-              value={followUpInput}
-              onChangeText={setFollowUpInput}
-              placeholder="AI generate answer is not medical advice. Consult a professional for skin or health concerns."
-              placeholderTextColor={TEXT_MUTED}
-              editable={!reAnalyzing}
-              multiline
-            />
-            <Pressable
-              onPress={() => void submitUserQuestion(followUpInput)}
-              disabled={reAnalyzing || !followUpInput.trim()}
-              style={[
-                styles.followUpSendBtn,
-                (reAnalyzing || !followUpInput.trim()) &&
-                  styles.followUpSendBtnDisabled,
-              ]}
-            >
-              {reAnalyzing ? (
-                <ActivityIndicator size="small" color="#fff" />
-              ) : (
-                <Text style={styles.followUpSendBtnText}>Send</Text>
-              )}
-            </Pressable>
-          </View>
-        </View>
+        {Platform.OS !== "web" ? askPanel : null}
 
         {/* AI Disclaimer — pinned to bottom of scroll content */}
         <View style={styles.disclaimerDrawer}>
@@ -1997,6 +2336,11 @@ export default function ReportScreen() {
           )}
         </View>
       </ScrollView>
+      {Platform.OS === "web" ? (
+        <View style={styles.webAskFooter}>
+          <View style={styles.webAskFooterInner}>{askPanel}</View>
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -2017,6 +2361,24 @@ const styles = StyleSheet.create({
     paddingBottom: 56,
     alignItems: "stretch",
     ...(Platform.OS === "web" ? ({ width: "100%" } as const) : null),
+  },
+  webAskFooter: {
+    position: "fixed",
+    left: 0,
+    right: 0,
+    bottom: 0,
+    zIndex: 1000,
+    backgroundColor: "rgba(255,255,255,0.98)",
+    borderTopWidth: 1,
+    borderTopColor: "#eee",
+  } as unknown as ViewStyle,
+  webAskFooterInner: {
+    maxWidth: 1000,
+    width: "100%",
+    alignSelf: "center",
+    paddingHorizontal: 24,
+    paddingTop: 12,
+    paddingBottom: 24,
   },
   tabRow: {
     flexDirection: "row",

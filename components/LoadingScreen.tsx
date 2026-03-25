@@ -1,7 +1,7 @@
 import { useEffect, useState, useRef, useCallback, useMemo } from "react";
-import { View, Text, StyleSheet, Pressable } from "react-native";
+import { View, Text, StyleSheet, Pressable, Animated, Easing, Image, Platform } from "react-native";
 import { MotiView, MotiText } from "moti";
-import Svg, { Path, Circle } from "react-native-svg";
+import { isActiveWhitelistToken } from "../services/ocrDetect";
 import {
   TEXT_PRIMARY,
   TEXT_SECONDARY,
@@ -9,35 +9,39 @@ import {
   THEME_BORDER,
   THEME_BORDER_STRONG,
 } from "../constants/theme";
-const TUBE_WIDTH = 48;
-const TUBE_HEIGHT = 200;
-const TUBE_BORDER_WIDTH = 2;
-const LIQUID_INSET = TUBE_BORDER_WIDTH;
-const LIQUID_WIDTH = TUBE_WIDTH - LIQUID_INSET * 2;
-const BUBBLE_COUNT = 14;
-const BUBBLE_LANES = 5;
 
-const STAGE_CONFIG = [
-  { height: 0.3, text: "Investigating ingredients..." },
-  { height: 0.6, text: "Evaluating effects..." },
-  { height: 0.9, text: "Preparing advice..." },
-  { height: 0.95, text: "Generating report..." },
-];
+const STREAM_WIDTH = 320;
+const STREAM_HEIGHT = 220;
+const SCAN_DURATION_MS = 1700;
+const AUTO_COMPLETE_MS = 18000;
+const WORD_BATCH_MS = 100;
+const WORD_TTL_MS = 2600;
+const SERIF_FONT_FAMILY = Platform.select({
+  ios: "Times New Roman",
+  android: "serif",
+  default: "serif",
+});
 
 type Props = {
   gotResult?: boolean;
   onFadeComplete?: () => void;
   onCancel?: () => void;
+  streamTokens?: Array<{ id: string; text: string }>;
+  allDetectedTokens?: string[];
+  hasData?: boolean;
+  highlightKeywords?: string[];
+  backgroundImageUri?: string;
 };
 
-type BubbleSeed = {
+type SpawnWord = {
+  id: string;
+  text: string;
   x: number;
+  y: number;
+  risePx: number;
+  floatMs: number;
   size: number;
-  duration: number;
-  delay: number;
-  drift: number;
-  start: number;
-  sway: number;
+  bornAt: number;
 };
 
 function seededUnit(index: number, salt: number) {
@@ -45,120 +49,248 @@ function seededUnit(index: number, salt: number) {
   return value - Math.floor(value);
 }
 
-function buildBubbleSeeds(count: number): BubbleSeed[] {
-  return Array.from({ length: count }, (_, index) => {
-    const size = 8 + Math.round(seededUnit(index, 1) * 4);
-    const lane = index % BUBBLE_LANES;
-    const laneStep = (LIQUID_WIDTH - 10) / (BUBBLE_LANES - 1);
-    const laneCenter = 5 + lane * laneStep;
-    const xJitter = -1.2 + seededUnit(index, 2) * 2.4;
-    const rawX = laneCenter - size / 2 + xJitter;
-    const x = Math.max(1, Math.min(LIQUID_WIDTH - size - 1, rawX));
-    const duration = 1700 + Math.round(seededUnit(index, 3) * 900);
-    // Slot-based staggering prevents all bubbles fading together.
-    const delay = (index % 6) * 220 + Math.round(seededUnit(index, 4) * 120);
-    const drift = -3 + seededUnit(index, 5) * 6;
-    const start = 6 + seededUnit(index, 6) * 44;
-    const sway = 1 + seededUnit(index, 7) * 2.2;
-    return { x, size, duration, delay, drift, start, sway };
-  });
+function normalizeKeyword(text: string): string {
+  return text
+    .toUpperCase()
+    .replace(/[^A-Z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-function buildLiquidPath({
-  width,
-  height,
-  phase,
-}: {
-  width: number;
-  height: number;
-  phase: number;
-}): string {
-  const amplitude = 5;
-  const baseY = 9 + Math.sin(phase * 0.65) * 0.8;
-  const wavelength = 22;
-  const step = 3;
-  const points: Array<{ x: number; y: number }> = [];
-  for (let x = 0; x <= width; x += step) {
-    const p = (x / wavelength) * Math.PI * 2;
-    const y =
-      baseY +
-      Math.sin(p + phase) * amplitude +
-      Math.sin(p * 0.5 + phase * 1.4) * amplitude * 0.35;
-    points.push({ x, y: Math.max(2, Math.min(18, y)) });
-  }
-  if (points[points.length - 1]?.x !== width) {
-    const p = (width / wavelength) * Math.PI * 2;
-    const y =
-      baseY +
-      Math.sin(p + phase) * amplitude +
-      Math.sin(p * 0.5 + phase * 1.4) * amplitude * 0.35;
-    points.push({ x: width, y: Math.max(2, Math.min(18, y)) });
-  }
-  let d = `M 0 ${height} L ${points[0].x} ${points[0].y}`;
-  for (let i = 1; i < points.length; i++) {
-    d += ` L ${points[i].x} ${points[i].y}`;
-  }
-  d += ` L ${width} ${height} Z`;
-  return d;
+function stageTextByPercent(percent: number): string {
+  if (percent < 30) return "scaning all the ingredients...";
+  if (percent < 65) return "analysing all the ingredients...";
+  if (percent < 85) return "writing summary... ";
+  return "finalizing...";
 }
 
-export function LoadingScreen({ gotResult = false, onFadeComplete, onCancel }: Props) {
-  const [currentStage, setCurrentStage] = useState(0);
-  const [liquidHeight, setLiquidHeight] = useState(0.3);
+function titleCaseToken(input: string): string {
+  return input
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+    .join(" ");
+}
+
+export function LoadingScreen({
+  gotResult = false,
+  onFadeComplete,
+  onCancel,
+  streamTokens: _streamTokens = [],
+  allDetectedTokens = [],
+  hasData: _hasData = false,
+  highlightKeywords = [],
+  backgroundImageUri,
+}: Props) {
   const [isFadingOut, setIsFadingOut] = useState(false);
-  const [wavePhase, setWavePhase] = useState(0);
+  const [loadingPercent, setLoadingPercent] = useState(0);
+  const [activeWords, setActiveWords] = useState<SpawnWord[]>([]);
   const timeoutsRef = useRef<ReturnType<typeof setTimeout>[]>([]);
-  const bubbleSeeds = useMemo(() => buildBubbleSeeds(BUBBLE_COUNT), []);
-  const liquidPath = useMemo(
-    () => buildLiquidPath({ width: LIQUID_WIDTH, height: 100, phase: wavePhase }),
-    [wavePhase]
+  const finishIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const onFadeCompleteRef = useRef(onFadeComplete);
+  onFadeCompleteRef.current = onFadeComplete;
+  const scanAnim = useRef(new Animated.Value(0)).current;
+  const finishStartedRef = useRef(false);
+  const progressStartedAtRef = useRef<number>(Date.now());
+  const loadingPercentRef = useRef(0);
+  const prevGotResultRef = useRef<boolean | undefined>(undefined);
+  const scanProgressRef = useRef(0);
+  const currentIndexRef = useRef(0);
+  const spawnStepRef = useRef(0);
+  const keywordSet = useMemo(
+    () => new Set(highlightKeywords.map((word) => normalizeKeyword(word))),
+    [highlightKeywords]
   );
+  // 仅真实 OCR 词池驱动词雨，无占位假词
+  const tokenPool = useMemo(() => {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const token of allDetectedTokens) {
+      const text = String(token ?? "").trim();
+      if (!text) continue;
+      const key = normalizeKeyword(text);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push(text);
+    }
+    return out;
+  }, [allDetectedTokens]);
+  const tokenPoolKey = useMemo(() => tokenPool.join("|"), [tokenPool]);
+  const canStartWordStream = !gotResult && !isFadingOut && tokenPool.length > 0;
+  const stageText = stageTextByPercent(loadingPercent);
+  loadingPercentRef.current = loadingPercent;
+
+  useEffect(() => {
+    progressStartedAtRef.current = Date.now();
+  }, []);
+
+  useEffect(() => {
+    currentIndexRef.current = 0;
+    spawnStepRef.current = 0;
+  }, [tokenPoolKey]);
 
   const clearTimeouts = useCallback(() => {
     timeoutsRef.current.forEach((t) => clearTimeout(t));
     timeoutsRef.current = [];
+    if (finishIntervalRef.current) {
+      clearInterval(finishIntervalRef.current);
+      finishIntervalRef.current = null;
+    }
   }, []);
 
+  const triggerFinish = useCallback((onDone?: () => void) => {
+    if (finishStartedRef.current) return;
+    finishStartedRef.current = true;
+    if (finishIntervalRef.current) {
+      clearInterval(finishIntervalRef.current);
+      finishIntervalRef.current = null;
+    }
+    const startAt = Date.now();
+    const startPercent = loadingPercentRef.current;
+    finishIntervalRef.current = setInterval(() => {
+      const t = Math.min(1, (Date.now() - startAt) / 300);
+      const next = Math.min(100, startPercent + (100 - startPercent) * t);
+      setLoadingPercent(next);
+      if (next >= 100) {
+        if (finishIntervalRef.current) {
+          clearInterval(finishIntervalRef.current);
+          finishIntervalRef.current = null;
+        }
+        const t1 = setTimeout(() => {
+          setIsFadingOut(true);
+          const t2 = setTimeout(() => {
+            onDone?.();
+          }, 400);
+          timeoutsRef.current.push(t2);
+        }, 150);
+        timeoutsRef.current.push(t1);
+      }
+    }, 16);
+  }, []);
+
+  const clearTimeoutsRef = useRef(clearTimeouts);
+  clearTimeoutsRef.current = clearTimeouts;
+  const triggerFinishRef = useRef(triggerFinish);
+  triggerFinishRef.current = triggerFinish;
+
   useEffect(() => {
+    const prev = prevGotResultRef.current;
+    prevGotResultRef.current = gotResult;
+
     if (gotResult) {
-      clearTimeouts();
-      setLiquidHeight(1);
-      setCurrentStage(4);
-      const t = setTimeout(() => {
-        setIsFadingOut(true);
-        const t2 = setTimeout(() => onFadeComplete?.(), 400);
-        timeoutsRef.current.push(t2);
-      }, 450);
-      timeoutsRef.current.push(t);
-      return () => clearTimeouts();
+      clearTimeoutsRef.current();
+      finishStartedRef.current = false;
+      triggerFinishRef.current(() => {
+        onFadeCompleteRef.current?.();
+      });
+      return () => clearTimeoutsRef.current();
     }
 
-    const t1 = setTimeout(() => {
-      setCurrentStage(1);
-      setLiquidHeight(0.6);
-    }, 2000);
-    const t2 = setTimeout(() => {
-      setCurrentStage(2);
-      setLiquidHeight(0.9);
-    }, 4000);
-    const t3 = setTimeout(() => {
-      setCurrentStage(3);
-      setLiquidHeight(0.95);
-    }, 6000);
+    if (prev === true && !gotResult) {
+      clearTimeoutsRef.current();
+      finishStartedRef.current = false;
+      setLoadingPercent(0);
+      setIsFadingOut(false);
+      setActiveWords([]);
+      progressStartedAtRef.current = Date.now();
+    }
 
-    timeoutsRef.current = [t1, t2, t3];
-    return () => clearTimeouts();
-  }, [gotResult, onFadeComplete, clearTimeouts]);
+    return undefined;
+  }, [gotResult]);
 
   useEffect(() => {
-    const timer = setInterval(() => {
-      setWavePhase((prev) => prev + 0.25);
-    }, 50);
-    return () => clearInterval(timer);
-  }, []);
+    return () => clearTimeouts();
+  }, [clearTimeouts]);
 
-  const stageText = gotResult ? "Generating report..." : STAGE_CONFIG[currentStage]?.text ?? STAGE_CONFIG[3].text;
-  const displayHeight = gotResult ? 1 : liquidHeight;
+  useEffect(() => {
+    if (gotResult) return;
+    const timer = setInterval(() => {
+      const elapsedMs = Date.now() - progressStartedAtRef.current;
+      if (elapsedMs >= AUTO_COMPLETE_MS) {
+        clearInterval(timer);
+        return;
+      }
+      setLoadingPercent((prev) => {
+        if (prev < 30) return prev + 0.3;
+        if (prev < 90) return prev + (92 - prev) * 0.04;
+        if (prev < 98) return prev + 0.08;
+        return prev;
+      });
+    }, 120);
+    return () => clearInterval(timer);
+  }, [gotResult]);
+
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(scanAnim, {
+          toValue: 1,
+          duration: SCAN_DURATION_MS,
+          easing: Easing.inOut(Easing.sin),
+          useNativeDriver: false,
+        }),
+        Animated.timing(scanAnim, {
+          toValue: 0,
+          duration: SCAN_DURATION_MS,
+          easing: Easing.inOut(Easing.sin),
+          useNativeDriver: false,
+        }),
+      ])
+    );
+    loop.start();
+    const id = scanAnim.addListener(({ value }) => {
+      scanProgressRef.current = value;
+    });
+    return () => {
+      scanAnim.removeListener(id);
+      loop.stop();
+    };
+  }, [scanAnim]);
+
+  useEffect(() => {
+    if (!canStartWordStream) return;
+    const timer = setInterval(() => {
+      setActiveWords((prev) => {
+        const now = Date.now();
+        const pruned = prev.filter((item) => now - item.bornAt < WORD_TTL_MS);
+        if (tokenPool.length === 0) return pruned;
+        let index = currentIndexRef.current;
+        if (index >= tokenPool.length) {
+          index = 0;
+          currentIndexRef.current = 0;
+        }
+        const batchSize = 3 + Math.floor(seededUnit(spawnStepRef.current, 9) * 3);
+        const remaining = tokenPool.length - index;
+        const spawnCount = Math.min(batchSize, remaining);
+        if (spawnCount <= 0) return pruned;
+        const scanY = Math.round(scanProgressRef.current * (STREAM_HEIGHT - 18)) + 8;
+        const spawned: SpawnWord[] = [];
+        for (let i = 0; i < spawnCount; i++) {
+          const seq = spawnStepRef.current * 7 + i;
+          const text = tokenPool[index + i];
+          spawned.push({
+            id: `spawn-${now}-${index + i}-${seq}`,
+            text,
+            x: Math.round(seededUnit(seq, 1) * (STREAM_WIDTH - 88)) + 18,
+            y: scanY,
+            risePx: 24 + Math.round(seededUnit(seq, 3) * 22),
+            floatMs: 850 + Math.round(seededUnit(seq, 2) * 500),
+            size: 12 + Math.round(seededUnit(seq, 4) * 4),
+            bornAt: now,
+          });
+        }
+        currentIndexRef.current = index + spawnCount;
+        spawnStepRef.current += 1;
+        return [...pruned, ...spawned].slice(-180);
+      });
+    }, WORD_BATCH_MS);
+    return () => clearInterval(timer);
+  }, [canStartWordStream, tokenPool]);
+
+  const scanTop = scanAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [2, STREAM_HEIGHT - 6],
+  });
 
   return (
     <MotiView
@@ -171,47 +303,58 @@ export function LoadingScreen({ gotResult = false, onFadeComplete, onCancel }: P
         duration: 400,
       }}
     >
-      <View style={styles.tubeWrapper}>
-        {/* Transparent test tube with scale marks */}
-        <View style={[styles.tube, styles.tubeBorder]}>
-          {[0.25, 0.5, 0.75, 1].map((y) => (
-            <View
-              key={y}
+      <View style={styles.streamCard}>
+        {backgroundImageUri ? (
+          <Image
+            source={{ uri: backgroundImageUri }}
+            style={styles.backgroundImage}
+            resizeMode="cover"
+          />
+        ) : null}
+        <View style={styles.streamBackdrop} />
+        {activeWords.map((item) => {
+          const tokenNorm = normalizeKeyword(item.text);
+          const isHotKeyword = tokenNorm.length > 0 && keywordSet.has(tokenNorm);
+          const isActiveToken = isActiveWhitelistToken(item.text);
+          return (
+            <MotiText
+              key={item.id}
               style={[
-                styles.scaleMark,
-                { bottom: `${(y - 0.05) * 100}%` },
+                styles.streamWord,
+                {
+                  left: item.x,
+                  top: item.y,
+                  fontSize: item.size,
+                  color: isActiveToken
+                    ? "#57f7ff"
+                    : isHotKeyword
+                      ? "#ffdd7e"
+                      : "rgba(236,229,255,0.78)",
+                  fontWeight: isActiveToken ? "700" : "600",
+                },
               ]}
-            />
-          ))}
+              from={{ opacity: 0, translateY: 12, scale: 0.92 }}
+              animate={{
+                opacity: isActiveToken ? 0.98 : 0.84,
+                translateY: -item.risePx,
+                scale: isActiveToken || isHotKeyword ? 1.08 : 1,
+              }}
+              transition={{
+                type: "timing",
+                duration: item.floatMs,
+              }}
+            >
+              {titleCaseToken(item.text)}
+            </MotiText>
+          );
+        })}
+        <Animated.View style={[styles.scanBar, { top: scanTop }]} />
+      </View>
 
-          {/* Liquid fill */}
-          <MotiView
-            style={styles.liquidContainer}
-            from={{ height: TUBE_HEIGHT * 0.3 }}
-            animate={{
-              height: TUBE_HEIGHT * displayHeight,
-            }}
-            transition={{
-              type: "timing",
-              duration: gotResult ? 400 : 800,
-            }}
-          >
-            <View style={styles.liquid}>
-              <Svg
-                width={LIQUID_WIDTH}
-                height="100%"
-                viewBox={`0 0 ${LIQUID_WIDTH} 100`}
-                preserveAspectRatio="none"
-                style={styles.liquidSvg}
-              >
-                <Path d={liquidPath} fill={THEME_COLOR} fillOpacity={0.92} />
-              </Svg>
-              {/* Bubbles */}
-              {bubbleSeeds.map((seed, i) => (
-                <Bubble key={i} seed={seed} />
-              ))}
-            </View>
-          </MotiView>
+      <View style={styles.progressWrap}>
+        <Text style={styles.progressText}>{Math.round(loadingPercent)}%</Text>
+        <View style={styles.progressTrack}>
+          <View style={[styles.progressFill, { width: `${loadingPercent}%` }]} />
         </View>
       </View>
 
@@ -231,47 +374,6 @@ export function LoadingScreen({ gotResult = false, onFadeComplete, onCancel }: P
   );
 }
 
-function Bubble({ seed }: { seed: BubbleSeed }) {
-  return (
-    <MotiView
-      style={[
-        styles.bubble,
-        {
-          left: seed.x,
-          bottom: seed.start,
-        },
-      ]}
-      from={{
-        translateY: 0,
-        translateX: 0,
-        opacity: 0,
-        scale: 0.85,
-      }}
-      animate={{
-        translateY: -TUBE_HEIGHT - 26,
-        translateX: [0, seed.drift, seed.drift + seed.sway, 0],
-        opacity: [0.35, 0.9, 0.88, 0.45],
-        scale: [0.92, 1.1, 1.06, 0.96],
-      }}
-      transition={{
-        type: "timing",
-        duration: seed.duration,
-        loop: true,
-        delay: seed.delay,
-      }}
-    >
-      <Svg width={seed.size} height={seed.size}>
-        <Circle
-          cx={seed.size / 2}
-          cy={seed.size / 2}
-          r={seed.size / 2.6}
-          fill="rgba(255,255,255,0.62)"
-        />
-      </Svg>
-    </MotiView>
-  );
-}
-
 const styles = StyleSheet.create({
   container: {
     flex: 1,
@@ -279,49 +381,69 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     paddingHorizontal: 24,
   },
-  tubeWrapper: {
-    marginBottom: 32,
-  },
-  tube: {
-    width: TUBE_WIDTH,
-    height: TUBE_HEIGHT,
-    borderRadius: TUBE_WIDTH / 2,
+  streamCard: {
+    width: STREAM_WIDTH,
+    height: STREAM_HEIGHT,
+    marginBottom: 18,
+    borderRadius: 16,
     overflow: "hidden",
-    backgroundColor: "rgba(113, 70, 232, 0.08)",
-  },
-  tubeBorder: {
-    borderWidth: 2,
+    position: "relative",
+    borderWidth: 1,
     borderColor: THEME_BORDER_STRONG,
+    backgroundColor: "rgba(40, 24, 84, 0.55)",
   },
-  scaleMark: {
-    position: "absolute",
-    left: -6,
-    width: 4,
-    height: 1,
-    backgroundColor: THEME_BORDER,
-  },
-  liquidContainer: {
-    position: "absolute",
-    bottom: 0,
-    left: LIQUID_INSET,
-    right: LIQUID_INSET,
-    borderBottomLeftRadius: LIQUID_WIDTH / 2,
-    borderBottomRightRadius: LIQUID_WIDTH / 2,
-    overflow: "hidden",
-  },
-  liquid: {
-    flex: 1,
-  },
-  liquidSvg: {
+  backgroundImage: {
     ...StyleSheet.absoluteFillObject,
   },
-  bubble: {
+  streamBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(113, 70, 232, 0.36)",
+  },
+  streamWord: {
     position: "absolute",
+    fontWeight: "600",
+    fontFamily: SERIF_FONT_FAMILY,
+  },
+  scanBar: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    height: 3,
+    backgroundColor: "rgba(208, 246, 255, 0.95)",
+    shadowColor: "#69f4ff",
+    shadowOpacity: 0.9,
+    shadowRadius: 14,
+    elevation: 4,
+  },
+  progressWrap: {
+    width: STREAM_WIDTH,
+    marginBottom: 14,
+  },
+  progressText: {
+    color: TEXT_PRIMARY,
+    fontSize: 14,
+    marginBottom: 8,
+    textAlign: "right",
+    fontFamily: SERIF_FONT_FAMILY,
+  },
+  progressTrack: {
+    width: "100%",
+    height: 6,
+    borderRadius: 999,
+    backgroundColor: "rgba(148, 163, 184, 0.24)",
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: THEME_BORDER,
+  },
+  progressFill: {
+    height: "100%",
+    backgroundColor: THEME_COLOR,
   },
   stageText: {
     color: TEXT_PRIMARY,
     fontSize: 15,
     textAlign: "center",
+    fontFamily: SERIF_FONT_FAMILY,
   },
   cancelButton: {
     marginTop: 24,
@@ -331,5 +453,6 @@ const styles = StyleSheet.create({
   cancelText: {
     color: TEXT_SECONDARY,
     fontSize: 14,
+    fontFamily: SERIF_FONT_FAMILY,
   },
 });

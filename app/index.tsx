@@ -9,7 +9,13 @@ import {
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import { Animated } from "react-native";
-import { clearReport, setReport, setPendingImage } from "../services/store";
+import {
+  clearReport,
+  MOCK_REPORT_SOURCE_KEY,
+  setReport,
+  setPendingImage,
+  startFreshAnalysisSession,
+} from "../services/store";
 import { MOCK_REPORT } from "../services/mockReport";
 import {
   BG,
@@ -57,6 +63,7 @@ export default function HomeScreen() {
 
   const pickImage = async (useCamera: boolean) => {
     setError(null);
+    startFreshAnalysisSession();
     clearReport();
     try {
       const launcher = useCamera
@@ -161,7 +168,9 @@ export default function HomeScreen() {
 
         <Pressable
           onPress={() => {
-            setReport(MOCK_REPORT);
+            setReport(MOCK_REPORT, {
+              analysisSourceKey: MOCK_REPORT_SOURCE_KEY,
+            });
             router.push("/report");
           }}
           style={({ pressed }) => [

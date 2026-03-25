@@ -2,18 +2,18 @@ import {
   View,
   Text,
   StyleSheet,
-  type ViewStyle,
   ScrollView,
   Pressable,
   ActivityIndicator,
   Platform,
   Animated,
   Easing,
-  TextInput,
   Alert,
 } from "react-native";
 import { useRouter } from "expo-router";
+import { useFocusEffect } from "@react-navigation/native";
 import { Ionicons } from "@expo/vector-icons";
+import MaterialCommunityIcons from "@expo/vector-icons/MaterialCommunityIcons";
 import { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import { LinearGradient } from "expo-linear-gradient";
 import Svg, { Circle, Path, Text as SvgText } from "react-native-svg";
@@ -25,6 +25,8 @@ import {
   getLastAnalyzedImage,
   getReport,
   getReportMeta,
+  makeAnalysisSourceKey,
+  MOCK_REPORT_SOURCE_KEY,
   setReport,
   setLastAnalyzedImage,
   clearPendingImage,
@@ -52,6 +54,7 @@ import type {
   SkinTypeToken,
 } from "../types/analysis";
 import { IngredientSection } from "../components/IngredientSection";
+import { AskPanel } from "../components/AskPanel";
 import { GreasinessGauge } from "../components/GreasinessGauge";
 import { SynergyProductCard } from "../components/SynergyProductCard";
 import { LoadingScreen } from "../components/LoadingScreen";
@@ -99,7 +102,7 @@ const CHIP_MISTAKE =
 "Identification seems incorrect. Please re-scan at pixel-level.";
 const CHIP_PREGNANCY =
   "I am pregnant. Is this product safe for me and the baby?";
-const AI_RESPONSE_PREFIX = "[AI Response]:";
+const AI_RESPONSE_PREFIX = "[Pro Insight]:";
 
 function getExpertAdviceLines(r: AnalysisResult): string[] {
   const ex = r.expert_advice;
@@ -115,6 +118,28 @@ function getExpertAdviceLines(r: AnalysisResult): string[] {
 
 function isAiResponseAdviceLine(text: string): boolean {
   return text.trimStart().startsWith(AI_RESPONSE_PREFIX);
+}
+
+function sanitizeAdviceDisplayLine(line: string): string {
+  return line.replace(/^\[Pro\s?Insight\]:\s*/i, "").trimStart();
+}
+
+type AdviceMciGlyph =
+  | "shield-check-outline"
+  | "information-outline"
+  | "flask-outline";
+
+function adviceLineMciName(raw: string, aiLine: boolean): AdviceMciGlyph {
+  if (aiLine) return "shield-check-outline";
+  const t = raw.toLowerCase();
+  if (
+    /\b(ingredient|formula|inci|%|acid|retinol|peptide|serum|spf|uv)\b/i.test(
+      t
+    )
+  ) {
+    return "flask-outline";
+  }
+  return "information-outline";
 }
 
 const MAX_REVEAL_STEP = 5;
@@ -871,6 +896,8 @@ const donutStyles = StyleSheet.create({
 export default function ReportScreen() {
   const router = useRouter();
   const controllerRef = useRef(new AbortController());
+  const reportScrollRef = useRef<ScrollView | null>(null);
+  const adviceSectionYRef = useRef(0);
   const revealTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
   const [report, setReportState] = useState<AnalysisResult | null>(null);
   const [loadingInitial, setLoadingInitial] = useState(false);
@@ -882,7 +909,9 @@ export default function ReportScreen() {
   const [showCategoryPicker, setShowCategoryPicker] = useState(false);
   const [reAnalyzing, setReAnalyzing] = useState(false);
   const [reAnalyzeError, setReAnalyzeError] = useState<string | null>(null);
-  const [followUpInput, setFollowUpInput] = useState("");
+  const [panelThinkingHint, setPanelThinkingHint] = useState<
+    PendingAnalysisParams["thinkingHint"] | undefined
+  >(undefined);
   const [disclaimerExpanded, setDisclaimerExpanded] = useState(false);
   const [reportTab, setReportTab] = useState<0 | 1>(0);
   const [expandedIngredientGroups, setExpandedIngredientGroups] = useState<
@@ -909,6 +938,7 @@ export default function ReportScreen() {
     base64: string;
     mimeType: string;
     ingredientText?: string;
+    thinkingHint?: PendingAnalysisParams["thinkingHint"];
   } | null>(null);
   const commitLoadingSuccessRef = useRef<
     (payload: {
@@ -916,6 +946,7 @@ export default function ReportScreen() {
       base64: string;
       mimeType: string;
       ingredientText?: string;
+      thinkingHint?: PendingAnalysisParams["thinkingHint"];
     }) => void
   >(() => {});
 
@@ -958,15 +989,23 @@ export default function ReportScreen() {
     base64: string;
     mimeType: string;
     ingredientText?: string;
+    thinkingHint?: PendingAnalysisParams["thinkingHint"];
   }) => {
     setReportState(payload.result);
+    setPanelThinkingHint(payload.thinkingHint);
+    const sid = getActiveAnalysisSessionId();
+    setReport(payload.result, {
+      sessionId: sid,
+      isFollowUpResponse: false,
+      thinkingHint: payload.thinkingHint,
+      analysisSourceKey: makeAnalysisSourceKey(sid, payload.base64),
+    });
     beginRevealSequence();
     setSafetyAuditUnlocked(false);
     setSafetyScoreUnlocked(false);
     const initialLines = getExpertAdviceLines(payload.result);
     setChatHistory(initialLines);
     lastLinesRef.current = initialLines;
-    const sid = getActiveAnalysisSessionId();
     chatSessionForStorageRef.current = sid;
     threadAnchorRef.current = { sessionId: sid, base64: payload.base64 };
     try {
@@ -1077,21 +1116,103 @@ export default function ReportScreen() {
     );
   };
 
-  useEffect(() => {
-    const params = getAnalysisParams();
-    if (!params) {
+  const lastFocusedParamsSigRef = useRef<string | null>(null);
+  const reportSnapshotRef = useRef<AnalysisResult | null>(null);
+  reportSnapshotRef.current = report;
+
+  useFocusEffect(
+    useCallback(() => {
+      const params = getAnalysisParams();
+      if (params) {
+        const sid = params.sessionId ?? getActiveAnalysisSessionId();
+        const sig = `${sid}:${params.base64.length}:${params.base64.slice(0, 80)}`;
+        if (
+          lastFocusedParamsSigRef.current === sig &&
+          reportSnapshotRef.current != null
+        ) {
+          return undefined;
+        }
+        lastFocusedParamsSigRef.current = sig;
+        setReportState(null);
+        controllerRef.current.abort();
+        controllerRef.current = new AbortController();
+        const { signal } = controllerRef.current;
+        pendingLoadingReportRef.current = null;
+        setLoadingGotResult(false);
+        setAllDetectedTokens([]);
+        setLoadingHasData(false);
+        setLoadingInitial(true);
+        setInitialError(null);
+        kickOffLoadingFirstPass(params, signal);
+        enrichAnalysisParamsIfNeeded(params, signal)
+          .then((resolved) => {
+            applyResolvedIngredientToLoading(resolved.ingredientText);
+            return analyzeImage(
+              resolved.base64,
+              resolved.mimeType,
+              signal,
+              resolved.categoryHint,
+              resolved.thinkingHint,
+              resolved.ingredientText
+            ).then((result) => ({ result, resolved }));
+          })
+          .then((result) => {
+            if (signal.aborted) return;
+            const r = result.resolved;
+            const keySid = r.sessionId ?? getActiveAnalysisSessionId();
+            setReport(result.result, {
+              sessionId: keySid,
+              isFollowUpResponse: false,
+              thinkingHint: r.thinkingHint,
+              analysisSourceKey: makeAnalysisSourceKey(keySid, r.base64),
+            });
+            pendingLoadingReportRef.current = {
+              result: result.result,
+              base64: r.base64,
+              mimeType: r.mimeType,
+              ingredientText: r.ingredientText,
+              thinkingHint: r.thinkingHint,
+            };
+            setLoadingGotResult(true);
+          })
+          .catch((e) => {
+            if (e instanceof Error && e.name === "AbortError") return;
+            pendingLoadingReportRef.current = null;
+            setLoadingGotResult(false);
+            setInitialError(e instanceof Error ? e.message : "Analysis failed");
+          })
+          .finally(() => {
+            if (signal.aborted) return;
+            if (!pendingLoadingReportRef.current) {
+              setLoadingInitial(false);
+            }
+          });
+        return undefined;
+      }
+
+      lastFocusedParamsSigRef.current = null;
       const cached = getReport();
       const cachedMeta = getReportMeta();
-      if (
-        cached &&
+      const active = getActiveAnalysisSessionId();
+      const sid = cachedMeta?.sessionId;
+      const cacheSourceKey = cachedMeta?.analysisSourceKey;
+      const keyOk =
         cachedMeta &&
-        cachedMeta.sessionId === getActiveAnalysisSessionId()
-      ) {
+        (cacheSourceKey === MOCK_REPORT_SOURCE_KEY ||
+          cacheSourceKey == null ||
+          (() => {
+            const img = getLastAnalyzedImage();
+            if (!img?.base64 || sid == null) return false;
+            return (
+              makeAnalysisSourceKey(img.sessionId, img.base64) ===
+              cacheSourceKey
+            );
+          })());
+      if (cached && cachedMeta && sid === active && keyOk) {
         setReportState(cached);
         beginRevealSequence();
         setSafetyAuditUnlocked(false);
         setSafetyScoreUnlocked(false);
-        const sid = cachedMeta.sessionId;
         chatSessionForStorageRef.current = sid;
         const baseline = getExpertAdviceLines(cached);
         lastLinesRef.current = baseline;
@@ -1104,93 +1225,19 @@ export default function ReportScreen() {
         } else {
           threadAnchorRef.current = null;
         }
-        let restored = false;
+        setChatHistory(baseline);
         try {
           if (typeof sessionStorage !== "undefined") {
-            const raw = sessionStorage.getItem(`${CHAT_STORAGE_PREFIX}${sid}`);
-            if (raw) {
-              const parsed = JSON.parse(raw) as unknown;
-              if (
-                Array.isArray(parsed) &&
-                parsed.every((x) => typeof x === "string")
-              ) {
-                setChatHistory(parsed.map(String).filter(Boolean));
-                restored = true;
-              }
-            }
+            sessionStorage.removeItem(`${CHAT_STORAGE_PREFIX}${sid}`);
           }
         } catch {
           /* ignore */
         }
-        if (!restored) setChatHistory(baseline);
+        setPanelThinkingHint(cachedMeta.thinkingHint);
       }
-      return;
-    }
-    controllerRef.current.abort();
-    controllerRef.current = new AbortController();
-    const { signal } = controllerRef.current;
-    pendingLoadingReportRef.current = null;
-    setLoadingGotResult(false);
-    setAllDetectedTokens([]);
-    setLoadingHasData(false);
-    setLoadingInitial(true);
-    setInitialError(null);
-    kickOffLoadingFirstPass(params, signal);
-    enrichAnalysisParamsIfNeeded(params, signal)
-      .then((resolved) => {
-        applyResolvedIngredientToLoading(resolved.ingredientText);
-        return analyzeImage(
-          resolved.base64,
-          resolved.mimeType,
-          signal,
-          resolved.categoryHint,
-          resolved.thinkingHint,
-          resolved.ingredientText
-        ).then((result) => ({ result, resolved }));
-      })
-      .then((result) => {
-        if (signal.aborted) return;
-        setReport(result.result, {
-          sessionId: result.resolved.sessionId,
-          isFollowUpResponse: false,
-        });
-        pendingLoadingReportRef.current = {
-          result: result.result,
-          base64: result.resolved.base64,
-          mimeType: result.resolved.mimeType,
-          ingredientText: result.resolved.ingredientText,
-        };
-        setLoadingGotResult(true);
-      })
-      .catch((e) => {
-        if (e instanceof Error && e.name === "AbortError") return;
-        pendingLoadingReportRef.current = null;
-        setLoadingGotResult(false);
-        setInitialError(e instanceof Error ? e.message : "Analysis failed");
-      })
-      .finally(() => {
-        if (signal.aborted) return;
-        if (!pendingLoadingReportRef.current) {
-          setLoadingInitial(false);
-        }
-      });
-  }, []);
-
-  useEffect(() => {
-    const sid = chatSessionForStorageRef.current;
-    if (chatHistory.length === 0 || sid == null) return;
-    if (sid !== getActiveAnalysisSessionId()) return;
-    try {
-      if (typeof sessionStorage !== "undefined") {
-        sessionStorage.setItem(
-          `${CHAT_STORAGE_PREFIX}${sid}`,
-          JSON.stringify(chatHistory)
-        );
-      }
-    } catch {
-      /* ignore */
-    }
-  }, [chatHistory]);
+      return undefined;
+    }, [])
+  );
 
   const ingredientGroups = useMemo(() => {
     if (!report) return [];
@@ -1200,17 +1247,31 @@ export default function ReportScreen() {
     );
   }, [report?.ingredients, report?.chartData]);
 
-  const submitUserQuestion = async (rawQuestion: string) => {
-    if (!report || reAnalyzing) return;
+  const scrollToAdviceSection = useCallback(() => {
+    if (Platform.OS === "web") {
+      const target = document.getElementById("report-must-knows-advice");
+      if (target) {
+        target.scrollIntoView({ behavior: "smooth", block: "start" });
+        return;
+      }
+    }
+    reportScrollRef.current?.scrollTo({
+      y: Math.max(0, adviceSectionYRef.current - 16),
+      animated: true,
+    });
+  }, []);
+
+  const submitUserQuestion = async (rawQuestion: string): Promise<boolean> => {
+    if (!report || reAnalyzing) return false;
     const userQuestion = rawQuestion.trim();
-    if (!userQuestion) return;
+    if (!userQuestion) return false;
     const imageForAsk = getPendingImage() ?? getLastAnalyzedImage();
     if (!imageForAsk?.base64) {
       Alert.alert(
         "Session expired",
         "Session expired, please re-scan the product."
       );
-      return;
+      return false;
     }
     controllerRef.current.abort();
     controllerRef.current = new AbortController();
@@ -1218,10 +1279,10 @@ export default function ReportScreen() {
     setReAnalyzeError(null);
     setReAnalyzing(true);
     const cat = categoryOverride ?? report.category;
-    const categoryHint =
-      cat === "unknown" ? undefined : cat;
-    const thinkingHint =
-      cat === "supplement" ? ("supplement" as const) : undefined;
+    const categoryHint = cat === "unknown" ? undefined : cat;
+    const mergedHint =
+      panelThinkingHint ??
+      (cat === "supplement" ? ("supplement" as const) : undefined);
     const ingredientText = imageForAsk.ingredientText?.trim() || undefined;
     try {
       const followUpSessionId = imageForAsk.sessionId;
@@ -1255,11 +1316,11 @@ export default function ReportScreen() {
         imageForAsk.mimeType,
         signal,
         categoryHint,
-        thinkingHint,
+        mergedHint,
         ingredientText,
         userQuestion
       );
-      if (signal.aborted) return;
+      if (signal.aborted) return false;
       const currentLines = getExpertAdviceLines(newData);
       const newItems = extractNewAdviceLines(currentLines, lastLinesRef.current);
       setChatHistory((prev) => prependUniqueOrdered(newItems, prev));
@@ -1280,19 +1341,33 @@ export default function ReportScreen() {
         setReport(next, {
           sessionId: followUpSessionId,
           isFollowUpResponse: true,
+          thinkingHint: mergedHint,
         });
         return next;
       });
       setRevealStep(MAX_REVEAL_STEP);
-      setFollowUpInput("");
+      const scheduleAdviceScroll = () => {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            scrollToAdviceSection();
+          });
+        });
+      };
+      if (reportTab !== 0) {
+        setReportTab(0);
+      }
+      scheduleAdviceScroll();
+      setTimeout(scheduleAdviceScroll, 80);
       if (newData.category !== "unknown") {
         clearPendingImage();
       }
+      return true;
     } catch (e) {
-      if (e instanceof Error && e.name === "AbortError") return;
+      if (e instanceof Error && e.name === "AbortError") return false;
       setReAnalyzeError(
         e instanceof Error ? e.message : "Follow-up request failed"
       );
+      return false;
     } finally {
       if (!signal.aborted) setReAnalyzing(false);
     }
@@ -1326,9 +1401,15 @@ export default function ReportScreen() {
         targetCategory,
         reAnalyzeThinkingHint
       );
+      setPanelThinkingHint(reAnalyzeThinkingHint);
       setReport(newReport, {
         sessionId: imageForReanalyze.sessionId,
         isFollowUpResponse: false,
+        thinkingHint: reAnalyzeThinkingHint,
+        analysisSourceKey: makeAnalysisSourceKey(
+          imageForReanalyze.sessionId,
+          imageForReanalyze.base64
+        ),
       });
       setReportState(newReport);
       const reLines = getExpertAdviceLines(newReport);
@@ -1391,15 +1472,19 @@ export default function ReportScreen() {
         resolved.ingredientText
       );
       if (signal.aborted) return;
+      const retrySid = resolved.sessionId ?? getActiveAnalysisSessionId();
       setReport(result, {
-        sessionId: resolved.sessionId,
+        sessionId: retrySid,
         isFollowUpResponse: false,
+        thinkingHint: resolved.thinkingHint,
+        analysisSourceKey: makeAnalysisSourceKey(retrySid, resolved.base64),
       });
       pendingLoadingReportRef.current = {
         result,
         base64: resolved.base64,
         mimeType: resolved.mimeType,
         ingredientText: resolved.ingredientText,
+        thinkingHint: resolved.thinkingHint,
       };
       setLoadingGotResult(true);
     } catch (e) {
@@ -1620,73 +1705,16 @@ export default function ReportScreen() {
         ? "🤯 overload formula"
         : "";
 
-  const askPanel = (
-    <View style={styles.followUpSection}>
-      <Text style={styles.followUpSectionTitle}>🙋 Ask Me Anything</Text>
-      <View style={styles.followUpChips}>
-        <Pressable
-          onPress={() => void submitUserQuestion(CHIP_MISTAKE)}
-          disabled={reAnalyzing}
-          style={[
-            styles.followUpChip,
-            reAnalyzing && styles.followUpChipDisabled,
-          ]}
-        >
-          <Text style={styles.followUpChipText}>🔍Wrong Detect？</Text>
-        </Pressable>
-        <Pressable
-          onPress={() => void submitUserQuestion(CHIP_PREGNANCY)}
-          disabled={reAnalyzing}
-          style={[
-            styles.followUpChip,
-            reAnalyzing && styles.followUpChipDisabled,
-          ]}
-        >
-          <Text style={styles.followUpChipText}>
-            🤰 Can I use it when pregnant？
-          </Text>
-        </Pressable>
-      </View>
-      <View style={styles.followUpInputRow}>
-        <TextInput
-          style={[
-            styles.followUpInput,
-            reAnalyzing && styles.followUpInputDisabled,
-          ]}
-          value={followUpInput}
-          onChangeText={setFollowUpInput}
-          placeholder="AI generate answer is not medical advice. Consult a professional for skin or health concerns."
-          placeholderTextColor={TEXT_MUTED}
-          editable={!reAnalyzing}
-          multiline
-        />
-        <Pressable
-          onPress={() => void submitUserQuestion(followUpInput)}
-          disabled={reAnalyzing || !followUpInput.trim()}
-          style={[
-            styles.followUpSendBtn,
-            (reAnalyzing || !followUpInput.trim()) &&
-              styles.followUpSendBtnDisabled,
-          ]}
-        >
-          {reAnalyzing ? (
-            <ActivityIndicator size="small" color="#fff" />
-          ) : (
-            <Text style={styles.followUpSendBtnText}>Send</Text>
-          )}
-        </Pressable>
-      </View>
-    </View>
-  );
+  const activeThinkingHint =
+    panelThinkingHint ??
+    (report.category === "supplement" ? ("supplement" as const) : undefined);
 
   return (
     <View style={[styles.container, { backgroundColor: BG }]}>
       <ScrollView
+        ref={reportScrollRef}
         style={styles.scroll}
-        contentContainerStyle={[
-          styles.scrollContent,
-          Platform.OS === "web" ? { paddingBottom: 150 } : null,
-        ]}
+        contentContainerStyle={styles.scrollContent}
         showsVerticalScrollIndicator={false}
       >
         <Pressable onPress={() => router.back()} style={styles.backButton}>
@@ -1949,33 +1977,42 @@ export default function ReportScreen() {
         )}
 
         {revealStep >= 4 && chatHistory.length > 0 && (
-          <>
+          <View
+            collapsable={false}
+            nativeID="report-must-knows-advice"
+            onLayout={(e) => {
+              adviceSectionYRef.current = e.nativeEvent.layout.y;
+            }}
+            style={
+              Platform.OS === "web"
+                ? ({ scrollMarginTop: 12, scrollMarginBottom: 180 } as any)
+                : undefined
+            }
+          >
             <Text style={styles.sectionTitle}>Must-Knows</Text>
-            <View style={[styles.card, styles.tipsHighlight]}>
+            <View style={styles.adviceCardList}>
               {chatHistory.map((tip, i) => {
                 const aiLine = isAiResponseAdviceLine(tip);
+                const display = sanitizeAdviceDisplayLine(tip);
+                const iconName = adviceLineMciName(tip, aiLine);
                 return (
                   <View
-                    key={`${i}-${tip.slice(0, 24)}`}
-                    style={[
-                      styles.bulletRow,
-                      aiLine && styles.aiResponseBulletRow,
-                    ]}
+                    key={`${i}-${display.slice(0, 24)}`}
+                    style={styles.adviceCard}
                   >
-                    <Text style={styles.bulletEmoji}>ℹ️</Text>
-                    <Text
-                      style={[
-                        styles.bulletText,
-                        aiLine && styles.aiResponseBulletText,
-                      ]}
-                    >
-                      {tip}
-                    </Text>
+                    <View style={styles.adviceIconCircle}>
+                      <MaterialCommunityIcons
+                        name={iconName}
+                        size={20}
+                        color="#7C3AED"
+                      />
+                    </View>
+                    <Text style={styles.adviceCardText}>{display}</Text>
                   </View>
                 );
               })}
             </View>
-          </>
+          </View>
         )}
 
         {revealStep >= 4 && summary.pros.length > 0 && (
@@ -2302,8 +2339,6 @@ export default function ReportScreen() {
           </>
         )}
 
-        {Platform.OS !== "web" ? askPanel : null}
-
         {/* AI Disclaimer — pinned to bottom of scroll content */}
         <View style={styles.disclaimerDrawer}>
           <Pressable
@@ -2335,12 +2370,18 @@ export default function ReportScreen() {
             </View>
           )}
         </View>
+        <View style={styles.scrollBottomSpacer} />
       </ScrollView>
-      {Platform.OS === "web" ? (
-        <View style={styles.webAskFooter}>
-          <View style={styles.webAskFooterInner}>{askPanel}</View>
-        </View>
-      ) : null}
+      <AskPanel
+        thinkingHint={activeThinkingHint}
+        language="cn"
+        disabled={reAnalyzing}
+        onSend={submitUserQuestion}
+        extraChips={[
+          { label: "🔍Wrong Detect？", query: CHIP_MISTAKE },
+          { label: "🤰 Can I use it when pregnant？", query: CHIP_PREGNANCY },
+        ]}
+      />
     </View>
   );
 }
@@ -2362,23 +2403,9 @@ const styles = StyleSheet.create({
     alignItems: "stretch",
     ...(Platform.OS === "web" ? ({ width: "100%" } as const) : null),
   },
-  webAskFooter: {
-    position: "fixed",
-    left: 0,
-    right: 0,
-    bottom: 0,
-    zIndex: 1000,
-    backgroundColor: "rgba(255,255,255,0.98)",
-    borderTopWidth: 1,
-    borderTopColor: "#eee",
-  } as unknown as ViewStyle,
-  webAskFooterInner: {
-    maxWidth: 1000,
+  scrollBottomSpacer: {
+    height: 160,
     width: "100%",
-    alignSelf: "center",
-    paddingHorizontal: 24,
-    paddingTop: 12,
-    paddingBottom: 24,
   },
   tabRow: {
     flexDirection: "row",
@@ -2609,93 +2636,49 @@ const styles = StyleSheet.create({
     borderColor: "rgba(239, 68, 68, 0.2)",
     gap: 20,
   },
-  tipsHighlight: {
-    backgroundColor: "rgba(251, 191, 36, 0.1)",
-    borderColor: "rgba(251, 191, 36, 0.25)",
-  },
-  aiResponseBulletRow: {
-    backgroundColor: "#FFF9C4",
-    borderRadius: 8,
-    paddingVertical: 8,
-    paddingHorizontal: 10,
-    marginLeft: -4,
-  },
-  aiResponseBulletText: {
-    fontWeight: "700",
-  },
-  followUpSection: {
-    marginTop: MODULE_GAP,
-    marginBottom: MODULE_GAP,
+  adviceCardList: {
     alignSelf: "stretch",
   },
-  followUpSectionTitle: {
-    color: THEME,
-    fontSize: MODULE_TITLE_SIZE,
-    fontWeight: "600",
-    marginBottom: MODULE_TITLE_TO_BODY,
-  },
-  followUpChips: {
+  adviceCard: {
     flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 10,
-    marginBottom: 14,
-  },
-  followUpChip: {
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    borderRadius: 999,
-    backgroundColor: THEME_SOFT,
-    borderWidth: 1,
-    borderColor: THEME_BORDER_STRONG,
-  },
-  followUpChipDisabled: {
-    opacity: 0.5,
-  },
-  followUpChipText: {
-    color: THEME,
-    fontSize: 14,
-    fontWeight: "600",
-  },
-  followUpInputRow: {
-    flexDirection: "row",
-    alignItems: "flex-end",
-    gap: 10,
-  },
-  followUpInput: {
-    flex: 1,
-    minHeight: 44,
-    maxHeight: 120,
-    marginTop: 0,
-    paddingVertical: 12,
-    paddingHorizontal: 14,
+    alignItems: "flex-start",
+    backgroundColor: "#F5F3FF",
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: THEME_BORDER_STRONG,
-    backgroundColor: CARD_BG,
-    color: TEXT_PRIMARY,
-    fontSize: 15,
-  },
-  followUpInputDisabled: {
-    opacity: 0.55,
-    backgroundColor: CARD_BORDER,
-  },
-  followUpSendBtn: {
+    borderColor: "#E9E4FF",
     paddingVertical: 12,
-    paddingHorizontal: 18,
-    borderRadius: 12,
-    backgroundColor: THEME,
-    minWidth: 72,
+    paddingHorizontal: 12,
+    marginBottom: 10,
+    ...Platform.select({
+      ios: {
+        shadowColor: "#8B5CF6",
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.05,
+        shadowRadius: 6,
+      },
+      android: { elevation: 2 },
+      default: {},
+    }),
+    ...(Platform.OS === "web"
+      ? ({
+          boxShadow: "0 2px 8px rgba(139, 92, 246, 0.08)",
+        } as object)
+      : {}),
+  },
+  adviceIconCircle: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: "#EDE9FE",
     alignItems: "center",
     justifyContent: "center",
-    minHeight: 44,
+    marginRight: 12,
   },
-  followUpSendBtnDisabled: {
-    opacity: 0.5,
-  },
-  followUpSendBtnText: {
-    color: "#fff",
-    fontSize: 15,
-    fontWeight: "700",
+  adviceCardText: {
+    flex: 1,
+    fontSize: 14,
+    lineHeight: 22,
+    color: "#4C1D95",
   },
   coreTagsSection: {
     marginBottom: MODULE_GAP,

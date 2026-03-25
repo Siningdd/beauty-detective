@@ -6,6 +6,7 @@ import {
   Pressable,
   Image,
   Modal,
+  ActivityIndicator,
 } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { Ionicons } from "@expo/vector-icons";
@@ -20,7 +21,6 @@ import {
   detectOcrAndHints,
   resolveHintDecision,
 } from "../services/ocrDetect";
-import { LoadingScreen } from "../components/LoadingScreen";
 import {
   BG,
   BUTTON_GRADIENT,
@@ -180,9 +180,16 @@ export default function PreviewScreen() {
   if (loading) {
     return (
       <View style={[styles.container, { backgroundColor: BG }]}>
-        <LoadingScreen
-          onCancel={loading ? handleBack : undefined}
-        />
+        <View style={styles.content}>
+          <Pressable onPress={handleBack} style={styles.topBar}>
+            <Ionicons name="arrow-back" size={24} color={TEXT_PRIMARY} />
+            <Text style={styles.backButtonText}>Back</Text>
+          </Pressable>
+          <View style={styles.uploadingCenter}>
+            <ActivityIndicator size="large" color={TEXT_PRIMARY} />
+            <Text style={styles.uploadingLabel}>Uploading image</Text>
+          </View>
+        </View>
       </View>
     );
   }
@@ -291,6 +298,17 @@ const styles = StyleSheet.create({
   content: {
     flex: 1,
     padding: 20,
+  },
+  uploadingCenter: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 16,
+  },
+  uploadingLabel: {
+    color: TEXT_PRIMARY,
+    fontSize: 16,
+    fontWeight: "500",
   },
   topBar: {
     flexDirection: "row",

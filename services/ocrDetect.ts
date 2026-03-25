@@ -23,12 +23,28 @@ export type OcrDetectionResult = {
   thinkingHint?: ThinkingHint;
   ocrText: string;
 };
+export type OcrStreamToken = {
+  id: string;
+  text: string;
+};
 type ClassifyKind =
   | "supplement"
   | "shampoo"
   | "skincare_serum"
   | "skincare_cream"
   | "unknown";
+
+export type SubtypeMeta = {
+  subtypeScore: number;
+  subtypeConfidence: "high" | "low";
+  subtypeLocked: boolean;
+};
+
+const DEFAULT_SUBTYPE_META: SubtypeMeta = {
+  subtypeScore: 0,
+  subtypeConfidence: "low",
+  subtypeLocked: false,
+};
 
 type WeightedRule = {
   regex: RegExp;
@@ -48,25 +64,50 @@ const VITAMIN_C_RE = /\bvitamin\s*c\b/i;
 const TOPICAL_VC_RE =
   /\b(ascorbic|ascorbyl|palmitate|skin|face|cream|serum|haut|gesicht)\b/i;
 
-const CREAM_NAME_SIGNALS_RE = /\b(cream|creme|balm|jelly|sorbet)\b/i;
-const SERUM_NAME_SIGNALS_RE = /\b(serum|essence|ampulle)\b/i;
-const JAR_CONTAINER_RE = /\b(jar|tiegel|dose)\b/i;
-
-const CREAM_BASE_RE =
-  /\b(cetearyl|carbomer|stearate|stearic|triglyceride|silica|dimethicone|isostearate|isononanoate|ethylhexyl|caprylic|butyrospermum|cera|wax|petrolatum|squalane|cetyl|stearyl|palmitate|myristate|behenyl|copolymer)\b/gi;
-const SERUM_BASE_RE =
-  /\b(hyaluronate|ascorbic|ferulic|propanediol|pentylene|butylene\s+glycol|dipropylene|glycereth|panthenol|niacinamide)\b/gi;
-const CLEANSER_RE =
-  /\b(betaine|sulfate|glucoside|isethionate|glutamate|amphoacetate|soap|reinigung|wash|cleanser|nettoyant)\b/gi;
+/** Strong rinse-off: lock subtype hints (EN/DE). */
+const STRONG_RINSE_RE =
+  /\b(sulfate|isethionate|lather|rinse|wash|cleanser|nettoyant|soap|saponified|reinigung|waschgel|abspuelen|duschgel)\b/i;
+const WEAK_RINSE_RE =
+  /\b(betaine|glucoside|amphoacetate|glutamate|coco-betaine|mizellen)\b/i;
+const GELLING_AGENTS_RE =
+  /\b(xanthan|carbomer|polyacrylate|crosspolymer|acryloyldimethyltaurate|hydroxyethylcellulose)\b/i;
+const HEAVY_OILS_RE =
+  /\b(butyrospermum|petrolatum|cera|wax|stearic|lanolin|mineraloel|sheabutter|bienenwachs|mandeloel|jojobaoel|arganoel|olivenoel|sonnenblumenoel|butter)\b/i;
+const EMULSIFIER_SYSTEM_RE =
+  /\b(glyceryl\s+stearate|peg-100\s+stearate|sorbitan\s+stearate|polysorbate|ceteareth|polyglyceryl)\b/i;
+const FATTY_ALCOHOLS_RE =
+  /\b(cetearyl\s+alcohol|cetyl\s+alcohol|stearyl\s+alcohol|behenyl\s+alcohol|fettalkohol)\b/i;
 const SUNSCREEN_RE =
-  /\b(homosalate|octocrylene|avobenzone|salicylate|benzophenone|titanium\s+dioxide|zinc\s+oxide|lichtschutz|sunscreen|sonnen)\b/gi;
-const ACTIVE_WHITELIST_RE =
-  /\b(niacinamide|ascorbic|retinol|salicylic|glycolic|peptide|ceramide|bakuchiol|resveratrol|tocopherol|tranexamic)\b/gi;
-
+  /\b(homosalate|octocrylene|avobenzone|salicylate|benzophenone|titanium\s+dioxide|zinc\s+oxide|lichtschutz|sunscreen|sonnen|sonnenschutz|lsf|spf|uv-schutz|uva|uvb|pa\+)\b/i;
+/** Title / marketing hints (normalized text; ä→ae already). */
+const CREAM_HINT_RE =
+  /\b(cream|creme|balm|balsam|tagespflege|nachtpflege|gesichtscreme|butter|gel[-\s]?cream)\b/i;
+const SERUM_STRONG_WORDS_RE =
+  /\b(serum|essence|konzentrat|ampulle|ampoule|tropfen|elixir)\b/i;
+const KUR_ONLY_RE = /\bkur\b/i;
+/**
+ * 敏感活性词根拦截（无词界；偏敏感，适配 OCR 碎片）
+ * 含 VC / VA / 烟酸族、多类酸根、肽、酯类常见词干，以及 ceramid / tocopher / vitamin / acid。
+ */
+const FORCE_THINKING_RE =
+  /(ascorb|retin|niacin|salicyl|glycol|lactic|mandel|glucon|tranexam|peptid|tretin|bakuch|resverat|ferul|ceramid|tocopher|vitamin|acid)/i;
+export const ACTIVE_WHITELIST = [
+  "niacinamide",
+  "ascorbic",
+  "retinol",
+  "salicylic",
+  "glycolic",
+  "peptide",
+  "ceramide",
+  "bakuchiol",
+  "resveratrol",
+  "tocopherol",
+  "tranexamic",
+] as const;
 const SKINCARE_BASE_MARKERS_RE =
   /\b(aqua|wasser|glycerin|propanediol|butylene\s+glycol|pentylene\s+glycol|carbomer|dimethicone|cetearyl|caprylic|triglyceride)\b/i;
-const HINT_STRONG_MARKERS_RE =
-  /\b(serum|konzentrat|ampulle|ampoule|creme|cream|balm|butter|dropper|essence)\b/i;
+
+const SUBTYPE_TITLE_WINDOW = 220;
 
 const SUPPLEMENT_RULES: WeightedRule[] = [
   { regex: /\b(nahrungsergaenzungsmittel|supplement facts|dietary supplement|verzehrempfehlung)\b/gi, weight: 20 },
@@ -134,10 +175,43 @@ function clampNonNegative(v: number): number {
   return Math.max(0, v);
 }
 
+function computeNameSignalDelta(titleWindow: string): number {
+  const creamHit = CREAM_HINT_RE.test(titleWindow);
+  const strongSerum = SERUM_STRONG_WORDS_RE.test(titleWindow);
+  const kurOnly = KUR_ONLY_RE.test(titleWindow) && !strongSerum;
+  if (creamHit && (strongSerum || kurOnly)) return 0;
+  let d = 0;
+  if (creamHit) d -= 30;
+  if (strongSerum) d += 30;
+  else if (kurOnly) d += 10;
+  return d;
+}
+
+function hasWhitelistActives(text: string): boolean {
+  return (
+    ACTIVE_WHITELIST.some((active) =>
+      new RegExp(`\\b${active}\\b`, "i").test(text)
+    ) ||
+    FORCE_THINKING_RE.test(text)
+  );
+}
+
+function hasStrongSerumTitle(titleWindow: string): boolean {
+  return (
+    SERUM_STRONG_WORDS_RE.test(titleWindow) ||
+    (KUR_ONLY_RE.test(titleWindow) && !CREAM_HINT_RE.test(titleWindow))
+  );
+}
+
+function hasStrongCreamTitle(titleWindow: string): boolean {
+  return CREAM_HINT_RE.test(titleWindow);
+}
+
 function classifyProduct(correctedText: string, rawOcrText: string): {
   kind: ClassifyKind;
   scores: { supplement: number; shampoo: number; skincare: number };
   margin: number;
+  meta: SubtypeMeta;
 } {
   const mainText = normalizeForScoring(correctedText).trim();
   const rawText = normalizeForScoring(rawOcrText).trim();
@@ -232,6 +306,7 @@ function classifyProduct(correctedText: string, rawOcrText: string): {
       kind: "unknown",
       scores,
       margin,
+      meta: { ...DEFAULT_SUBTYPE_META },
     };
   }
 
@@ -240,6 +315,7 @@ function classifyProduct(correctedText: string, rawOcrText: string): {
       kind: "supplement",
       scores,
       margin,
+      meta: { ...DEFAULT_SUBTYPE_META },
     };
   }
   if (winner === "shampoo") {
@@ -247,6 +323,7 @@ function classifyProduct(correctedText: string, rawOcrText: string): {
       kind: "shampoo",
       scores,
       margin,
+      meta: { ...DEFAULT_SUBTYPE_META },
     };
   }
 
@@ -259,49 +336,72 @@ function classifyProduct(correctedText: string, rawOcrText: string): {
       kind: "supplement",
       scores,
       margin,
+      meta: { ...DEFAULT_SUBTYPE_META },
     };
   }
 
-  // --- Enter skincare second-stage classification ---
-  let subtypeScore = 0;
+  // --- Skincare subtype: signal-driven scoring ---
   const textLower = scoringText.toLowerCase();
+  const isStrongWashOff = countRegexHits(textLower, STRONG_RINSE_RE) > 0;
+  const isSunscreen = countRegexHits(textLower, SUNSCREEN_RE) > 0;
+  const subtypeLocked = isStrongWashOff || isSunscreen;
 
-  // A. Priority interceptors: cleanser/sunscreen should not enter deep subtyping.
-  if (
-    countRegexHits(textLower, CLEANSER_RE) > 0 ||
-    countRegexHits(textLower, SUNSCREEN_RE) > 0
-  ) {
-    return { kind: "skincare_cream", scores, margin };
+  if (subtypeLocked) {
+    return {
+      kind: "skincare_cream",
+      scores,
+      margin,
+      meta: {
+        subtypeScore: 0,
+        subtypeConfidence: "low",
+        subtypeLocked: true,
+      },
+    };
   }
 
-  // B. Name/texture signal weights.
-  if (SERUM_NAME_SIGNALS_RE.test(scoringText)) subtypeScore += 30;
-  if (CREAM_NAME_SIGNALS_RE.test(scoringText)) subtypeScore -= 30;
-  if (JAR_CONTAINER_RE.test(scoringText)) {
-    subtypeScore -= 25;
+  let subtypeScore = 0;
+  const titleWindow = scoringText.slice(0, SUBTYPE_TITLE_WINDOW);
+
+  subtypeScore += computeNameSignalDelta(titleWindow);
+
+  const gellingHits = countRegexHits(textLower, GELLING_AGENTS_RE);
+  subtypeScore += gellingHits * 10;
+
+  const heavy = countRegexHits(textLower, HEAVY_OILS_RE) > 0;
+  const fatty = countRegexHits(textLower, FATTY_ALCOHOLS_RE) > 0;
+  const emul = countRegexHits(textLower, EMULSIFIER_SYSTEM_RE) > 0;
+  const trioCount = (heavy ? 1 : 0) + (fatty ? 1 : 0) + (emul ? 1 : 0);
+  if (trioCount === 3) subtypeScore -= 35;
+  else if (trioCount === 2) subtypeScore -= 15;
+  else if (trioCount === 1) subtypeScore -= 15;
+
+  if (countRegexHits(textLower, WEAK_RINSE_RE) > 0) {
+    subtypeScore *= 0.35;
   }
 
-  // C. Ingredient-density scoring.
-  const creamHits = countRegexHits(textLower, CREAM_BASE_RE);
-  const serumHits = countRegexHits(textLower, SERUM_BASE_RE);
-  subtypeScore -= creamHits * 10;
-  subtypeScore += serumHits * 8;
+  const subtypeConfidence: SubtypeMeta["subtypeConfidence"] =
+    Math.abs(subtypeScore) >= 18 ? "high" : "low";
 
-  // D. Decision thresholds.
   let finalKind: ClassifyKind = "skincare_cream";
   if (subtypeScore >= 18) finalKind = "skincare_serum";
-  if (subtypeScore <= -18) finalKind = "skincare_cream";
+  else if (subtypeScore <= -18) finalKind = "skincare_cream";
 
   return {
     kind: finalKind,
     scores,
     margin,
+    meta: {
+      subtypeScore,
+      subtypeConfidence,
+      subtypeLocked: false,
+    },
   };
 }
 
 function classifyKindToHints(
   kind: ClassifyKind,
-  text: string
+  text: string,
+  meta: SubtypeMeta
 ): {
   categoryHint?: CategoryHint;
   thinkingHint?: ThinkingHint;
@@ -318,13 +418,15 @@ function classifyKindToHints(
     };
   }
   if (kind === "skincare_serum") {
+    if (meta.subtypeLocked || meta.subtypeConfidence === "low") {
+      return { categoryHint: "skincare" };
+    }
     const normalized = normalizeForScoring(text);
-    const hasStrongType = HINT_STRONG_MARKERS_RE.test(normalized);
-    const hasActives = countRegexHits(normalized, ACTIVE_WHITELIST_RE) > 0;
-    if (!hasStrongType && !hasActives) {
-      return {
-        categoryHint: "skincare",
-      };
+    const titleWindow = normalized.slice(0, SUBTYPE_TITLE_WINDOW);
+    const hasActives = hasWhitelistActives(normalized);
+    const strongName = hasStrongSerumTitle(titleWindow);
+    if (!hasActives && !strongName) {
+      return { categoryHint: "skincare" };
     }
     return {
       categoryHint: "skincare",
@@ -332,13 +434,15 @@ function classifyKindToHints(
     };
   }
   if (kind === "skincare_cream") {
+    if (meta.subtypeLocked || meta.subtypeConfidence === "low") {
+      return { categoryHint: "skincare" };
+    }
     const normalized = normalizeForScoring(text);
-    const hasStrongType = HINT_STRONG_MARKERS_RE.test(normalized);
-    const hasActives = countRegexHits(normalized, ACTIVE_WHITELIST_RE) > 0;
-    if (!hasStrongType && !hasActives) {
-      return {
-        categoryHint: "skincare",
-      };
+    const titleWindow = normalized.slice(0, SUBTYPE_TITLE_WINDOW);
+    const hasActives = hasWhitelistActives(normalized);
+    const strongName = hasStrongCreamTitle(titleWindow);
+    if (!hasActives && !strongName) {
+      return { categoryHint: "skincare" };
     }
     return {
       categoryHint: "skincare",
@@ -438,6 +542,156 @@ async function extractRawText(options: {
     return extractTextNative(options.uri);
   }
   return "";
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve(fallback);
+    }, timeoutMs);
+    promise
+      .then((value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      })
+      .catch(() => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(fallback);
+      });
+  });
+}
+
+export async function extractRawTextFast(
+  options: { uri?: string; base64?: string },
+  timeoutMs = 100
+): Promise<string> {
+  const safeTimeout = Number.isFinite(timeoutMs) ? Math.max(50, timeoutMs) : 100;
+  const raw = await withTimeout(extractRawText(options), safeTimeout, "");
+  return String(raw ?? "").trim();
+}
+
+export async function extractRawTextLate(
+  options: { uri?: string; base64?: string },
+  timeoutMs = 4000
+): Promise<string> {
+  const safeTimeout = Number.isFinite(timeoutMs) ? Math.max(300, timeoutMs) : 4000;
+  const raw = await withTimeout(extractRawText(options), safeTimeout, "");
+  return String(raw ?? "").trim();
+}
+
+function normalizeKeywordPiece(input: string): string {
+  return input
+    .toUpperCase()
+    .replace(/[^A-Z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function isActiveWhitelistToken(input: string): boolean {
+  const text = input.toLowerCase().trim();
+  if (text.length < 3) return false;
+  return FORCE_THINKING_RE.test(text);
+}
+
+export function tokenizeOcrStream(rawText: string, maxTokens = 120): OcrStreamToken[] {
+  const raw = String(rawText ?? "").trim();
+  if (!raw) return [];
+
+  const collapsed = raw.replace(/\s+/g, " ").trim();
+  // 禁止引入字符级 split("") 逻辑，确保单词完整性以供 isActiveWhitelistToken 判定
+  const words = collapsed
+    .split(/[\s,;:|/\\]+/)
+    .map((w) => w.trim())
+    .filter(Boolean);
+  return words.slice(0, maxTokens).map((text, index) => ({
+    id: `${index}-${text}`,
+    text,
+  }));
+}
+
+const FALLBACK_STREAM_TOKENS = [
+  "AQUA",
+  "GLYCERIN",
+  "NIACINAMIDE",
+  "VITAMIN C",
+  "PANTHENOL",
+  "SODIUM",
+  "HYALURONATE",
+  "CERAMIDE",
+  "EXTRACT",
+  "PEPTIDE",
+];
+
+export function buildFallbackStreamTokens(): OcrStreamToken[] {
+  return FALLBACK_STREAM_TOKENS.map((text, index) => ({
+    id: `fallback-${index}-${text}`,
+    text,
+  }));
+}
+
+export function mergeOcrStreamTokens(input: {
+  primary: OcrStreamToken[];
+  secondary?: OcrStreamToken[];
+  limit?: number;
+}): OcrStreamToken[] {
+  const limit = Math.max(1, input.limit ?? 120);
+  const merged = [...input.primary, ...(input.secondary ?? [])];
+  const out: OcrStreamToken[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < merged.length; i++) {
+    const token = merged[i];
+    const key = normalizeKeywordPiece(token.text);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      id: `${i}-${key}`,
+      text: token.text,
+    });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+const DEFAULT_KEYWORDS = [
+  "AQUA",
+  "WATER",
+  "GLYCERIN",
+  "VITAMIN C",
+  "NIACINAMIDE",
+  "HYALURONIC ACID",
+  "SODIUM HYALURONATE",
+  "RETINOL",
+  "CERAMIDE",
+];
+
+export function extractHighlightKeywords(input: {
+  correctedText?: string;
+  rawText?: string;
+  limit?: number;
+}): string[] {
+  const limit = Math.max(6, input.limit ?? 16);
+  const merged = [input.correctedText, input.rawText].filter(Boolean).join(", ");
+  const tokens = merged
+    .split(/[,;\n]/)
+    .map((part) => normalizeKeywordPiece(part))
+    .filter((item) => item.length >= 4);
+  const rank = [...DEFAULT_KEYWORDS, ...tokens];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const token of rank) {
+    if (!token || seen.has(token)) continue;
+    seen.add(token);
+    out.push(token);
+    if (out.length >= limit) break;
+  }
+  return out;
 }
 
 function normalizeOcrNoise(input: string): string {
@@ -606,7 +860,26 @@ export async function detectOcrAndHints(options: {
   const raw = detected.rawOcrText.trim();
   const mergedText = [corrected, raw].filter(Boolean).join("\n");
   const classified = classifyProduct(corrected, raw);
-  const hints = classifyKindToHints(classified.kind, corrected || raw);
+  let hints = classifyKindToHints(
+    classified.kind,
+    corrected || raw,
+    classified.meta
+  );
+
+  const compressedRaw = raw.toLowerCase().replace(/[\s,.;:|/\\]/g, "");
+  const hasSensitiveActives =
+    FORCE_THINKING_RE.test(compressedRaw) ||
+    FORCE_THINKING_RE.test(corrected.toLowerCase());
+
+  if (hasSensitiveActives) {
+    if (__DEV__) {
+      console.log("[ocrDetect] 成分表词根命中: 强行开启 Thinking Flow");
+    }
+    if (!hints.categoryHint || (hints.categoryHint as string) === "unknown") {
+      hints.categoryHint = "skincare";
+    }
+    hints.thinkingHint = "essence";
+  }
 
   if (__DEV__) {
     console.log(
@@ -624,11 +897,13 @@ export async function detectOcrAndHints(options: {
       JSON.stringify(
         {
           confidenceHint: detected.confidenceHint,
+          hasSensitiveActives,
           thinkingHint: hints.thinkingHint ?? "none",
           categoryHint: hints.categoryHint ?? "none",
           classifyKind: classified.kind,
           scores: classified.scores,
           margin: classified.margin,
+          subtypeMeta: classified.meta,
         },
         null,
         2

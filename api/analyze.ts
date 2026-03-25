@@ -52,8 +52,8 @@ const IMAGE_MODEL = "gemini-2.0-flash-lite-001";
 /** Shared generation defaults (maps to REST generationConfig). */
 const DEFAULT_GENERATE_CONTENT_CONFIG = {
   temperature: 0.2,
-  /** Large ingredient JSON can exceed 2k tokens; truncation causes JSON.parse failures. */
-  maxOutputTokens: 8192,
+  /** Keep the overall response bounded; lower limits may truncate large JSON payloads. */
+  maxOutputTokens: 3500,
   responseMimeType: "application/json",
 } as const;
 

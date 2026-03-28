@@ -23,6 +23,8 @@ export type PendingAnalysisParams = {
   categoryHint?: "skincare" | "supplement" | "haircare";
   thinkingHint?: "supplement" | "essence" | "cream" | "special";
   ingredientText?: string;
+  /** Raw OCR text for safety scan before AI */
+  ocrRawText?: string;
   sessionId?: number;
 };
 
@@ -39,6 +41,7 @@ type SessionBoundImage = {
   base64: string;
   mimeType: string;
   ingredientText?: string;
+  ocrRawText?: string;
   sessionId: number;
 };
 
@@ -139,6 +142,7 @@ export function setPendingImage(data: {
   base64: string;
   mimeType: string;
   ingredientText?: string;
+  ocrRawText?: string;
 }) {
   pendingImage = {
     ...data,
@@ -159,6 +163,7 @@ export function setLastAnalyzedImage(data: {
   base64: string;
   mimeType: string;
   ingredientText?: string;
+  ocrRawText?: string;
 }) {
   lastAnalyzedImage = {
     ...data,

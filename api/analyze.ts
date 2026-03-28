@@ -31,7 +31,7 @@ const GEMINI_API_KEY =
 
 if (!GEMINI_API_KEY) {
   console.warn(
-    "GEMINI_API_KEY 或 GOOGLE_API_KEY 未设置。请在 .env 中配置。"
+    "GEMINI_API_KEY or GOOGLE_API_KEY is not set. Configure one of them in .env."
   );
 }
 
@@ -653,15 +653,133 @@ function normalizeCoreTagItems(raw: unknown, category: AnalysisResult["category"
   return out;
 }
 
-/** First top-level `{ ... }` in `s`, respecting strings (avoids greedy `\{[\s\S]*\}` breaking on nested objects). */
-function extractFirstBalancedJsonObject(s: string): string | null {
+function sanitizeJsonTrailing(fragment: string): string {
+  let t = fragment;
+  let guard = 0;
+  const max = t.length + 2;
+  while (guard++ < max) {
+    const wsStripped = t.replace(/\s+$/u, "");
+    if (wsStripped !== t) {
+      t = wsStripped;
+      continue;
+    }
+    if (t.endsWith(",") || t.endsWith(":")) {
+      t = t.slice(0, -1);
+      continue;
+    }
+    break;
+  }
+  return t;
+}
+
+/**
+ * Scan from first `{`, tracking `[` / `{` outside strings.
+ * Strict: returns slice only if the root object closes with balanced stack.
+ * Repair: on EOF with non-empty stack or trailing junk, close open string, sanitize, append closers.
+ */
+function scanFromFirstBrace(
+  s: string,
+  mode: "strict" | "repair"
+): string | null {
   const start = s.indexOf("{");
   if (start < 0) return null;
+
+  const stack: ("{" | "[")[] = [];
+  let inString = false;
+  let escape = false;
+
+  stack.push("{");
+  for (let i = start + 1; i < s.length; i++) {
+    const c = s[i]!;
+    if (inString) {
+      if (escape) {
+        escape = false;
+      } else if (c === "\\") {
+        escape = true;
+      } else if (c === '"') {
+        inString = false;
+      }
+    } else {
+      if (c === '"') {
+        inString = true;
+      } else if (c === "{") {
+        stack.push("{");
+      } else if (c === "[") {
+        stack.push("[");
+      } else if (c === "}") {
+        if (stack.length > 0 && stack[stack.length - 1] === "{") {
+          stack.pop();
+          if (stack.length === 0) {
+            return s.slice(start, i + 1);
+          }
+        }
+      } else if (c === "]") {
+        if (stack.length > 0 && stack[stack.length - 1] === "[") {
+          stack.pop();
+        }
+      }
+    }
+  }
+
+  if (mode === "strict") return null;
+
+  let body = s.slice(start);
+  if (inString) {
+    body += '"';
+  }
+  body = sanitizeJsonTrailing(body);
+  for (let k = stack.length - 1; k >= 0; k--) {
+    body += stack[k] === "{" ? "}" : "]";
+  }
+  return body;
+}
+
+function extractStrictBalancedJsonObject(s: string): string | null {
+  return scanFromFirstBrace(s, "strict");
+}
+
+function extractRepairedJsonObject(s: string): string | null {
+  return scanFromFirstBrace(s, "repair");
+}
+
+function skipToArrayOpenAfterKey(s: string, keyEnd: number): number | null {
+  let i = keyEnd;
+  while (i < s.length && /\s/u.test(s[i]!)) i++;
+  if (i >= s.length || s[i] !== ":") return null;
+  i++;
+  while (i < s.length && /\s/u.test(s[i]!)) i++;
+  if (i >= s.length || s[i] !== "[") return null;
+  return i + 1;
+}
+
+function findEarliestIngredientsArrayContentStart(s: string): number | null {
+  let best: number | null = null;
+  const considerKey = (key: string) => {
+    let from = 0;
+    while (from < s.length) {
+      const p = s.indexOf(key, from);
+      if (p < 0) break;
+      const inner = skipToArrayOpenAfterKey(s, p + key.length);
+      if (inner != null && (best === null || inner < best)) best = inner;
+      from = p + 1;
+    }
+  };
+  considerKey('"ingredients_deep_dive"');
+  considerKey('"ingredients"');
+  return best;
+}
+
+/** `{...}` from `start` (must be `{`); respects strings. O(n) slice length. */
+function extractBalancedObjectSlice(
+  s: string,
+  start: number
+): { slice: string; end: number } | null {
+  if (s[start] !== "{") return null;
   let depth = 0;
   let inString = false;
   let escape = false;
   for (let i = start; i < s.length; i++) {
-    const c = s[i];
+    const c = s[i]!;
     if (inString) {
       if (escape) {
         escape = false;
@@ -677,20 +795,80 @@ function extractFirstBalancedJsonObject(s: string): string | null {
         depth++;
       } else if (c === "}") {
         depth--;
-        if (depth === 0) return s.slice(start, i + 1);
+        if (depth === 0) {
+          return { slice: s.slice(start, i + 1), end: i + 1 };
+        }
       }
     }
   }
   return null;
 }
 
+function scavengeIngredientsToRaw(
+  s: string
+): Record<string, unknown> | null {
+  const innerStart = findEarliestIngredientsArrayContentStart(s);
+  if (innerStart == null) return null;
+
+  const parsedObjects: Record<string, unknown>[] = [];
+  let i = innerStart;
+  while (i < s.length) {
+    while (i < s.length && /\s/u.test(s[i]!)) i++;
+    if (i >= s.length || s[i] === "]" || s[i] === "}") break;
+    if (s[i] === ",") {
+      i++;
+      continue;
+    }
+    if (s[i] !== "{") break;
+    const chunk = extractBalancedObjectSlice(s, i);
+    if (!chunk) break;
+    try {
+      parsedObjects.push(JSON.parse(chunk.slice) as Record<string, unknown>);
+    } catch {
+      // skip malformed element
+    }
+    i = chunk.end;
+  }
+
+  if (parsedObjects.length === 0) return null;
+  return {
+    ingredients: parsedObjects,
+    category: "unknown",
+    is_partial: true,
+  };
+}
+
+function parseJsonTry(s: string): Record<string, unknown> | null {
+  try {
+    return JSON.parse(s) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function emptyAnalysisParseFallback(): Record<string, unknown> {
+  return {};
+}
+
 function parseJsonObject(text: string): Record<string, unknown> {
   const trimmed = text.trim();
   const codeBlockMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
-  const jsonStr = codeBlockMatch
-    ? codeBlockMatch[1].trim()
-    : extractFirstBalancedJsonObject(trimmed) ?? trimmed;
-  return JSON.parse(jsonStr) as Record<string, unknown>;
+  const base = codeBlockMatch ? codeBlockMatch[1].trim() : trimmed;
+
+  const strictSlice = extractStrictBalancedJsonObject(base);
+  if (strictSlice != null) {
+    const ok = parseJsonTry(strictSlice);
+    if (ok) return ok;
+  }
+
+  const repairedSlice = extractRepairedJsonObject(base) ?? base;
+  const repairedOk = parseJsonTry(repairedSlice);
+  if (repairedOk) return repairedOk;
+
+  const scavenged = scavengeIngredientsToRaw(base);
+  if (scavenged) return scavenged;
+
+  return emptyAnalysisParseFallback();
 }
 
 function extractJson(text: string): AnalysisResult {
@@ -1257,7 +1435,7 @@ export async function analyzeCosmeticImage(
         )
       : meta;
   console.log(
-    `\n[Thinking: ${useThinking ? "ON" : "OFF"} | categoryHint: ${categoryHint ?? "无"} | thinkingHint: ${thinkingHint ?? "无"} | ocrText: ${hasIngredientText ? "YES" : "NO"} | userQuestion: ${hasUserQuestion ? "YES" : "NO"}] Gemini usageMetadata:`,
+    `\n[Thinking: ${useThinking ? "ON" : "OFF"} | categoryHint: ${categoryHint ?? "none"} | thinkingHint: ${thinkingHint ?? "none"} | ocrText: ${hasIngredientText ? "YES" : "NO"} | userQuestion: ${hasUserQuestion ? "YES" : "NO"}] Gemini usageMetadata:`,
     JSON.stringify(plain ?? {}, null, 2)
   );
 
@@ -1317,8 +1495,8 @@ export async function analyzeCosmeticText(
       : meta;
   console.log(
     `\n[AnalyzeText: thinking=${useThinking ? "ON" : "OFF"} | categoryHint: ${
-      categoryHint ?? "无"
-    } | thinkingHint: ${thinkingHint ?? "无"}] Gemini usageMetadata:`,
+      categoryHint ?? "none"
+    } | thinkingHint: ${thinkingHint ?? "none"}] Gemini usageMetadata:`,
     JSON.stringify(plain ?? {}, null, 2)
   );
 

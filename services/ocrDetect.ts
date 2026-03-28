@@ -7,6 +7,14 @@
 import { Image, Platform } from "react-native";
 import { canonicalizeIngredientKey } from "../constants/ingredientDict";
 
+export {
+  BANNED_INGREDIENT_GROUPS,
+  CRITICAL_BANNED_LIST,
+  EU_BANNED_LIST,
+  detectCriticalBannedIngredient,
+  type SafetyCategoryHint,
+} from "./criticalBan";
+
 export type ThinkingHint = "supplement" | "essence" | "cream" | "special";
 
 export type CategoryHint = "skincare" | "haircare" | "supplement";
@@ -873,7 +881,9 @@ export async function detectOcrAndHints(options: {
 
   if (hasSensitiveActives) {
     if (__DEV__) {
-      console.log("[ocrDetect] 成分表词根命中: 强行开启 Thinking Flow");
+      console.log(
+        "[ocrDetect] Ingredient-list root match: forcing Thinking Flow on"
+      );
     }
     if (!hints.categoryHint || (hints.categoryHint as string) === "unknown") {
       hints.categoryHint = "skincare";

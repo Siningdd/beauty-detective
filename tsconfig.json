@@ -7,5 +7,5 @@
       "@/*": ["./*"]
     }
   },
-  "include": ["app/**/*", "services/**/*", "types/**/*", "constants/**/*"]
+  "include": ["app/**/*", "services/**/*", "types/**/*", "constants/**/*", "components/**/*"]
 }

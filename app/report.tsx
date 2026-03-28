@@ -32,7 +32,7 @@ import {
   clearPendingImage,
   type PendingAnalysisParams,
 } from "../services/store";
-import { analyzeImage } from "../services/api";
+import { analyzeImage, HIGH_RISK_INGREDIENT_CODE } from "../services/api";
 import {
   buildFallbackStreamTokens,
   detectOcrAndHints,
@@ -58,6 +58,7 @@ import { AskPanel } from "../components/AskPanel";
 import { GreasinessGauge } from "../components/GreasinessGauge";
 import { SynergyProductCard } from "../components/SynergyProductCard";
 import { LoadingScreen } from "../components/LoadingScreen";
+import { HighRiskModal } from "../components/HighRiskModal";
 import { PaywallCard } from "../components/PaywallCard";
 import { SkeletonBlock, SkeletonLine, SkeletonPill } from "../components/SkeletonBlock";
 import { normalizeSkinTypes } from "../utils/skinTypes";
@@ -103,6 +104,19 @@ const CHIP_MISTAKE =
 const CHIP_PREGNANCY =
   "I am pregnant. Is this product safe for me and the baby?";
 const AI_RESPONSE_PREFIX = "[Pro Insight]:";
+
+function getHighRiskIngredientFromError(e: unknown): string | null {
+  if (!(e instanceof Error)) return null;
+  const ex = e as Error & { code?: string; ingredient?: string };
+  if (
+    ex.code === HIGH_RISK_INGREDIENT_CODE &&
+    typeof ex.ingredient === "string" &&
+    ex.ingredient.length > 0
+  ) {
+    return ex.ingredient;
+  }
+  return null;
+}
 
 function getExpertAdviceLines(r: AnalysisResult): string[] {
   const ex = r.expert_advice;
@@ -568,7 +582,14 @@ async function enrichAnalysisParamsIfNeeded(
   params: PendingAnalysisParams,
   _signal: AbortSignal
 ): Promise<PendingAnalysisParams> {
-  if (params.ingredientText?.trim()) return params;
+  if (params.ingredientText?.trim()) {
+    if (params.ocrRawText?.trim()) return params;
+    const pendingEarly = getPendingImage();
+    if (pendingEarly?.ocrRawText?.trim()) {
+      return { ...params, ocrRawText: pendingEarly.ocrRawText };
+    }
+    return params;
+  }
   const pending = getPendingImage();
   if (!pending?.uri || !pending.base64 || !pending.mimeType) return params;
 
@@ -587,6 +608,7 @@ async function enrichAnalysisParamsIfNeeded(
     categoryHint: resolved?.categoryHint,
     thinkingHint: resolved?.thinkingHint,
     ingredientText,
+    ocrRawText: detected.rawOcrText?.trim() || undefined,
   };
 }
 
@@ -909,6 +931,8 @@ export default function ReportScreen() {
   const [showCategoryPicker, setShowCategoryPicker] = useState(false);
   const [reAnalyzing, setReAnalyzing] = useState(false);
   const [reAnalyzeError, setReAnalyzeError] = useState<string | null>(null);
+  const [highRiskModalVisible, setHighRiskModalVisible] = useState(false);
+  const [highRiskIngredientName, setHighRiskIngredientName] = useState("");
   const [panelThinkingHint, setPanelThinkingHint] = useState<
     PendingAnalysisParams["thinkingHint"] | undefined
   >(undefined);
@@ -938,6 +962,7 @@ export default function ReportScreen() {
     base64: string;
     mimeType: string;
     ingredientText?: string;
+    ocrRawText?: string;
     thinkingHint?: PendingAnalysisParams["thinkingHint"];
   } | null>(null);
   const commitLoadingSuccessRef = useRef<
@@ -946,6 +971,7 @@ export default function ReportScreen() {
       base64: string;
       mimeType: string;
       ingredientText?: string;
+      ocrRawText?: string;
       thinkingHint?: PendingAnalysisParams["thinkingHint"];
     }) => void
   >(() => {});
@@ -989,6 +1015,7 @@ export default function ReportScreen() {
     base64: string;
     mimeType: string;
     ingredientText?: string;
+    ocrRawText?: string;
     thinkingHint?: PendingAnalysisParams["thinkingHint"];
   }) => {
     setReportState(payload.result);
@@ -1020,6 +1047,7 @@ export default function ReportScreen() {
       base64: payload.base64,
       mimeType: payload.mimeType,
       ingredientText: payload.ingredientText,
+      ocrRawText: payload.ocrRawText,
     });
     if (payload.result.category !== "unknown") {
       clearPendingImage();
@@ -1153,7 +1181,9 @@ export default function ReportScreen() {
               signal,
               resolved.categoryHint,
               resolved.thinkingHint,
-              resolved.ingredientText
+              resolved.ingredientText,
+              undefined,
+              resolved.ocrRawText
             ).then((result) => ({ result, resolved }));
           })
           .then((result) => {
@@ -1171,6 +1201,7 @@ export default function ReportScreen() {
               base64: r.base64,
               mimeType: r.mimeType,
               ingredientText: r.ingredientText,
+              ocrRawText: r.ocrRawText,
               thinkingHint: r.thinkingHint,
             };
             setLoadingGotResult(true);
@@ -1179,6 +1210,12 @@ export default function ReportScreen() {
             if (e instanceof Error && e.name === "AbortError") return;
             pendingLoadingReportRef.current = null;
             setLoadingGotResult(false);
+            const hr = getHighRiskIngredientFromError(e);
+            if (hr) {
+              setHighRiskIngredientName(hr);
+              setHighRiskModalVisible(true);
+              return;
+            }
             setInitialError(e instanceof Error ? e.message : "Analysis failed");
           })
           .finally(() => {
@@ -1318,7 +1355,8 @@ export default function ReportScreen() {
         categoryHint,
         mergedHint,
         ingredientText,
-        userQuestion
+        userQuestion,
+        imageForAsk.ocrRawText
       );
       if (signal.aborted) return false;
       const currentLines = getExpertAdviceLines(newData);
@@ -1364,6 +1402,12 @@ export default function ReportScreen() {
       return true;
     } catch (e) {
       if (e instanceof Error && e.name === "AbortError") return false;
+      const hr = getHighRiskIngredientFromError(e);
+      if (hr) {
+        setHighRiskIngredientName(hr);
+        setHighRiskModalVisible(true);
+        return false;
+      }
       setReAnalyzeError(
         e instanceof Error ? e.message : "Follow-up request failed"
       );
@@ -1394,12 +1438,16 @@ export default function ReportScreen() {
     try {
       const reAnalyzeThinkingHint =
         targetCategory === "supplement" ? "supplement" : undefined;
+      const reIng = imageForReanalyze.ingredientText?.trim() || undefined;
       const newReport = await analyzeImage(
         imageForReanalyze.base64,
         imageForReanalyze.mimeType,
         signal,
         targetCategory,
-        reAnalyzeThinkingHint
+        reAnalyzeThinkingHint,
+        reIng,
+        undefined,
+        imageForReanalyze.ocrRawText
       );
       setPanelThinkingHint(reAnalyzeThinkingHint);
       setReport(newReport, {
@@ -1439,6 +1487,12 @@ export default function ReportScreen() {
       }
     } catch (e) {
       if (e instanceof Error && e.name === "AbortError") return;
+      const hr = getHighRiskIngredientFromError(e);
+      if (hr) {
+        setHighRiskIngredientName(hr);
+        setHighRiskModalVisible(true);
+        return;
+      }
       setReAnalyzeError(e instanceof Error ? e.message : "Re-analysis failed");
     } finally {
       setReAnalyzing(false);
@@ -1469,7 +1523,9 @@ export default function ReportScreen() {
         signal,
         resolved.categoryHint,
         resolved.thinkingHint,
-        resolved.ingredientText
+        resolved.ingredientText,
+        undefined,
+        resolved.ocrRawText
       );
       if (signal.aborted) return;
       const retrySid = resolved.sessionId ?? getActiveAnalysisSessionId();
@@ -1484,6 +1540,7 @@ export default function ReportScreen() {
         base64: resolved.base64,
         mimeType: resolved.mimeType,
         ingredientText: resolved.ingredientText,
+        ocrRawText: resolved.ocrRawText,
         thinkingHint: resolved.thinkingHint,
       };
       setLoadingGotResult(true);
@@ -1491,6 +1548,12 @@ export default function ReportScreen() {
       if (e instanceof Error && e.name === "AbortError") return;
       pendingLoadingReportRef.current = null;
       setLoadingGotResult(false);
+      const hr = getHighRiskIngredientFromError(e);
+      if (hr) {
+        setHighRiskIngredientName(hr);
+        setHighRiskModalVisible(true);
+        return;
+      }
       setInitialError(e instanceof Error ? e.message : "Analysis failed");
     } finally {
       if (signal.aborted) return;
@@ -1555,6 +1618,11 @@ export default function ReportScreen() {
               } as any)}
             />
           </View>
+          <HighRiskModal
+            visible={highRiskModalVisible}
+            ingredient={highRiskIngredientName}
+            onClose={() => setHighRiskModalVisible(false)}
+          />
         </View>
       );
     }
@@ -1573,6 +1641,11 @@ export default function ReportScreen() {
             <Text style={styles.backButtonText}>Back</Text>
           </Pressable>
         </View>
+        <HighRiskModal
+          visible={highRiskModalVisible}
+          ingredient={highRiskIngredientName}
+          onClose={() => setHighRiskModalVisible(false)}
+        />
       </View>
     );
   }
@@ -2381,6 +2454,11 @@ export default function ReportScreen() {
           { label: "🔍Wrong Detect？", query: CHIP_MISTAKE },
           { label: "🤰 Can I use it when pregnant？", query: CHIP_PREGNANCY },
         ]}
+      />
+      <HighRiskModal
+        visible={highRiskModalVisible}
+        ingredient={highRiskIngredientName}
+        onClose={() => setHighRiskModalVisible(false)}
       />
     </View>
   );

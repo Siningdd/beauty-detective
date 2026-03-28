@@ -38,35 +38,25 @@ Supplements: poor sleeper, workout, etc.
 Haircare: color treatment, Anti-dandruff etc
 skincare: sensitive skin, anti-aging, etc
 
-8. main_functions: REQUIRED object with fixed keys. 
+8. main_functions: REQUIRED object with fixed keys. STRICT RULE: The 'label' must align with the category context. DO NOT use skincare terminology (e.g., 'Moisture lock') for supplements, and vice versa.
 - Style: "Action + Benefit"
 - Max 2 words per label. plus 1 emoji per label.
 - Logic: Identify <= 3 core functions from the ingredient list.
 - Skincare Examples:
 
 {"label": "🧬 Cell repair", "feature_tag": "Repair"},
-
 {"label": "💧 Moisture lock", "feature_tag": "Hydrating"},
-
 {"label": "🛡️ Age defense", "feature_tag": "Antioxidant"}
 
-
-
 - Haircare Examples:
-
 {"label": "☁️ Root lift", "feature_tag": "Cleansing"},
-
 {"label": "✨ Frizz control", "feature_tag": "Smoothing"},
-
 {"label": "🩹 Fiber mend", "feature_tag": "Repair"}
 
-
 - Supplement Examples:
-
 {"label": "🧠 Focus sharpener", "feature_tag": "Core-Active"},
 {"label": "🌙 Sleep aid", "feature_tag": "Core-Active"},
 {"label": "🛠️ Metabolic co-factor", "feature_tag": "Co-factors"}
-
 
 9. expert_advice: 
 - **User-Query Override (TOP PRIORITY)**: If “userQuestion” is provided, the FIRST item MUST be a direct, 1-2 sentence response to the user's inquiry (e.g., pregnancy safety, specific skin type compatibility, or layering with other products). Prefix this with "[Pro Insight]: ".
@@ -97,6 +87,7 @@ max 2 items.
 - **unfiltered_risks**: 
   - step 1: identify the main features of the unsafe ingredients.
   - step 2: define if need to worry in a short paragraph in daily language.
+active, punchy, auditor-style language only
   
 14. User Feedback Loop (Priority Context)
 If the user provides additional input (e.g., a question or a correction), adjust your analysis priority as follows:
@@ -107,7 +98,7 @@ Scenario B: Follow-up Inquiry
 If the user input is a question (e.g., "Is it safe for pregnancy?", "Can I use it with Retinol?"):
 Instruction: Keep the ingredient recognition consistent. Use your internal dermatological/supplement knowledge to provide a professional, tailored response. Crucial: You MUST put this specific answer at the beginning of the expert_advice field to ensure the user sees it immediately.
 
-  JSON shape:
+JSON shape:
 {
   "category": "skincare" | "haircare" | "supplement" | "unknown",
   "main_functions": {
@@ -118,7 +109,7 @@ Instruction: Keep the ingredient recognition consistent. Use your internal derma
     ]
   },
   "summary": {
-    "the_real_talk": "sharp and human-style verdict. Identify if the product's primary marketing claim (e.g., Brightening, Anti-aging, Repair) matches the actual strength of ingredients (especially is_major:true items). Be specific about the core actives and ingredients in THIS product. provide a concise conlusion if you recommend this product with a recommend price range in euro, eg. x-x euro. ",
+    "the_real_talk": "sharp and human-style verdict. Identify if the product's primary marketing claim (e.g., Brightening, Anti-aging, Repair) matches the actual strength of ingredients (especially is_major:true items). Be specific about the core actives and ingredients in THIS product. provide a concise conlusion if you recommend this product with a recommend price range in euro, eg. x-x euro. "
     "the_wins": [
       "[active or their combination]: Explain the result they deliver the promised benefit (e.g., Stable VC for glow).",
       "[Formulation Perk]: Highlight a non-active benefit like texture, delivery system (DMI/liposomes), or premium base oils.",
@@ -130,7 +121,7 @@ Instruction: Keep the ingredient recognition consistent. Use your internal derma
       "[Sensitizers]: Point out specific irritants,or high-strength warnings (SPF requirement)."
     ]
   },
-  "ingredients_deep_dive": 
+  "ingredients_deep_dive":[
     {
       "name": "Panthenol (B5)",
       "feature_tag": "token from pool",

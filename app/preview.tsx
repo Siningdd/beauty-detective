@@ -20,7 +20,9 @@ import {
 import {
   detectOcrAndHints,
   resolveHintDecision,
+  detectCriticalBannedIngredient,
 } from "../services/ocrDetect";
+import { HighRiskModal } from "../components/HighRiskModal";
 import {
   BG,
   BUTTON_GRADIENT,
@@ -46,6 +48,9 @@ export default function PreviewScreen() {
   const [unknownIngredientText, setUnknownIngredientText] = useState<string | null>(
     null
   );
+  const [unknownOcrRawText, setUnknownOcrRawText] = useState<string | null>(null);
+  const [highRiskVisible, setHighRiskVisible] = useState(false);
+  const [highRiskIngredient, setHighRiskIngredient] = useState("");
 
   useEffect(() => {
     setPending(getPendingImage());
@@ -69,6 +74,9 @@ export default function PreviewScreen() {
     clearJumpTimer();
     didNavigateRef.current = false;
     setUnknownIngredientText(null);
+    setUnknownOcrRawText(null);
+    setHighRiskVisible(false);
+    setHighRiskIngredient("");
     setLoading(false);
     clearPendingImage();
     router.back();
@@ -85,8 +93,11 @@ export default function PreviewScreen() {
       categoryHint: options.categoryHint,
       thinkingHint: options.thinkingHint,
       ingredientText: unknownIngredientText,
+      ocrRawText:
+        unknownOcrRawText?.trim() || unknownIngredientText.trim() || undefined,
     });
     setUnknownIngredientText(null);
+    setUnknownOcrRawText(null);
     setLoading(true);
     jumpToReport();
   };
@@ -126,17 +137,33 @@ export default function PreviewScreen() {
         categoryHint: detected.categoryHint,
         thinkingHint: detected.thinkingHint,
       });
+      const ocrForSafety = `${detected.rawOcrText}\n${detected.correctedText}`;
+      const bannedHit = detectCriticalBannedIngredient(
+        ocrForSafety,
+        resolved?.categoryHint
+      );
+      if (bannedHit) {
+        if (signal.aborted) return;
+        clearJumpTimer();
+        didNavigateRef.current = false;
+        setLoading(false);
+        setHighRiskIngredient(bannedHit);
+        setHighRiskVisible(true);
+        return;
+      }
       setPendingImage({
         uri: pending.uri,
         base64: pending.base64,
         mimeType: pending.mimeType,
         ingredientText,
+        ocrRawText: detected.rawOcrText,
       });
       if (!resolved) {
         if (signal.aborted || didNavigateRef.current) return;
         clearJumpTimer();
         setLoading(false);
         setUnknownIngredientText(ingredientText || "");
+        setUnknownOcrRawText(detected.rawOcrText || "");
         return;
       }
       setAnalysisParams({
@@ -145,6 +172,7 @@ export default function PreviewScreen() {
         categoryHint: resolved.categoryHint,
         thinkingHint: resolved.thinkingHint,
         ingredientText,
+        ocrRawText: detected.rawOcrText,
       });
       if (signal.aborted) return;
       jumpToReport();
@@ -230,6 +258,14 @@ export default function PreviewScreen() {
 
         {error && <Text style={styles.error}>{error}</Text>}
       </View>
+      <HighRiskModal
+        visible={highRiskVisible}
+        ingredient={highRiskIngredient}
+        onClose={() => {
+          setHighRiskVisible(false);
+          setHighRiskIngredient("");
+        }}
+      />
       <Modal visible={!!unknownIngredientText} transparent animationType="fade">
         <View style={styles.selectorOverlay}>
           <View style={styles.selectorCard}>
@@ -279,7 +315,10 @@ export default function PreviewScreen() {
               </Pressable>
               <Pressable
                 style={styles.selectorCancel}
-                onPress={() => setUnknownIngredientText(null)}
+                onPress={() => {
+                  setUnknownIngredientText(null);
+                  setUnknownOcrRawText(null);
+                }}
               >
                 <Text style={styles.selectorCancelText}>Cancel</Text>
               </Pressable>

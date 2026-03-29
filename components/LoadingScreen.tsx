@@ -3,6 +3,10 @@ import { View, Text, StyleSheet, Pressable, Animated, Easing, Image, Platform } 
 import { MotiView, MotiText } from "moti";
 import { isActiveWhitelistToken } from "../services/ocrDetect";
 import {
+  getLoadingPhaseMessage,
+  type LoadingPhase,
+} from "../types/loadingPhase";
+import {
   TEXT_PRIMARY,
   TEXT_SECONDARY,
   THEME as THEME_COLOR,
@@ -31,6 +35,9 @@ type Props = {
   hasData?: boolean;
   highlightKeywords?: string[];
   backgroundImageUri?: string;
+  phase?: LoadingPhase;
+  phaseMessage?: string;
+  externalProgress?: number;
 };
 
 type SpawnWord = {
@@ -81,6 +88,9 @@ export function LoadingScreen({
   hasData: _hasData = false,
   highlightKeywords = [],
   backgroundImageUri,
+  phase,
+  phaseMessage,
+  externalProgress,
 }: Props) {
   const [isFadingOut, setIsFadingOut] = useState(false);
   const [loadingPercent, setLoadingPercent] = useState(0);
@@ -117,7 +127,13 @@ export function LoadingScreen({
   }, [allDetectedTokens]);
   const tokenPoolKey = useMemo(() => tokenPool.join("|"), [tokenPool]);
   const canStartWordStream = !gotResult && !isFadingOut && tokenPool.length > 0;
-  const stageText = stageTextByPercent(loadingPercent);
+  const displayLoadingPercent =
+    !gotResult && typeof externalProgress === "number"
+      ? Math.max(0, Math.min(100, externalProgress))
+      : loadingPercent;
+  const stageText =
+    phaseMessage?.trim() ||
+    (phase ? getLoadingPhaseMessage(phase) : stageTextByPercent(displayLoadingPercent));
   loadingPercentRef.current = loadingPercent;
 
   useEffect(() => {
@@ -203,7 +219,7 @@ export function LoadingScreen({
   }, [clearTimeouts]);
 
   useEffect(() => {
-    if (gotResult) return;
+    if (gotResult || typeof externalProgress === "number") return;
     const timer = setInterval(() => {
       const elapsedMs = Date.now() - progressStartedAtRef.current;
       if (elapsedMs >= AUTO_COMPLETE_MS) {
@@ -218,7 +234,7 @@ export function LoadingScreen({
       });
     }, 120);
     return () => clearInterval(timer);
-  }, [gotResult]);
+  }, [gotResult, externalProgress]);
 
   useEffect(() => {
     const loop = Animated.loop(
@@ -352,9 +368,9 @@ export function LoadingScreen({
       </View>
 
       <View style={styles.progressWrap}>
-        <Text style={styles.progressText}>{Math.round(loadingPercent)}%</Text>
+        <Text style={styles.progressText}>{Math.round(displayLoadingPercent)}%</Text>
         <View style={styles.progressTrack}>
-          <View style={[styles.progressFill, { width: `${loadingPercent}%` }]} />
+          <View style={[styles.progressFill, { width: `${displayLoadingPercent}%` }]} />
         </View>
       </View>
 

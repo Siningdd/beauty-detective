@@ -9,6 +9,8 @@ import {
   Animated,
   Easing,
   Alert,
+  Modal,
+  TextInput,
 } from "react-native";
 import { useRouter } from "expo-router";
 import { useFocusEffect } from "@react-navigation/native";
@@ -44,6 +46,19 @@ import {
   tokenizeOcrStream,
   type OcrStreamToken,
 } from "../services/ocrDetect";
+import { applyOcrCorrectionMapToText } from "../utils/ocrCorrectionApply";
+import {
+  appendCorrectionEvent,
+  loadUserCorrectionMap,
+  mergeCorrectionEntry,
+  type CorrectionTrackAction,
+} from "../services/userOcrCorrections";
+import {
+  loadUserInterestMap,
+  shouldUseCuriousPlaceholder,
+  type UserInterestMap,
+} from "../services/userInterestService";
+import { AnalyticsService } from "../services/AnalyticsService";
 import type {
   AnalysisIngredient,
   AnalysisResult,
@@ -53,7 +68,11 @@ import type {
   GreasinessLevel,
   SkinTypeToken,
 } from "../types/analysis";
-import { IngredientSection } from "../components/IngredientSection";
+import {
+  getLoadingPhaseRange,
+  type LoadingPhase,
+} from "../types/loadingPhase";
+import { IngredientAuditList } from "../components/IngredientAuditList";
 import { AskPanel } from "../components/AskPanel";
 import { GreasinessGauge } from "../components/GreasinessGauge";
 import { SynergyProductCard } from "../components/SynergyProductCard";
@@ -62,7 +81,7 @@ import { HighRiskModal } from "../components/HighRiskModal";
 import { PaywallCard } from "../components/PaywallCard";
 import { SkeletonBlock, SkeletonLine, SkeletonPill } from "../components/SkeletonBlock";
 import { normalizeSkinTypes } from "../utils/skinTypes";
-import { sortChartDataDesc, buildChartSegments } from "../utils/formulationChart";
+import { buildChartSegments } from "../utils/formulationChart";
 import { getLinkedTheme } from "../utils/semanticTagBridge";
 import { ensureProConEmoji } from "../api/featureTagEmoji";
 import {
@@ -98,11 +117,13 @@ const CATEGORY_LABELS: Record<Exclude<Category, "unknown">, string> = {
   haircare: "Haircare",
 };
 type EditableCategory = Exclude<Category, "unknown">;
+type EnrichedAnalysisParams = PendingAnalysisParams & {
+  needsCategoryConfirm?: boolean;
+  suggestedCategoryHint?: EditableCategory;
+};
+const LOW_CONFIDENCE_CATEGORY_MESSAGE =
+  "识别不确定，请先确认产品类型再继续分析。";
 
-const CHIP_MISTAKE =
-"Identification seems incorrect. Please re-scan at pixel-level.";
-const CHIP_PREGNANCY =
-  "I am pregnant. Is this product safe for me and the baby?";
 const AI_RESPONSE_PREFIX = "[Pro Insight]:";
 
 function getHighRiskIngredientFromError(e: unknown): string | null {
@@ -550,45 +571,57 @@ function donutSlicePath(
   ].join(" ");
 }
 
-/** Preserves INCI order within each group; group order follows chart (desc), then A–Z. */
-function groupIngredientsByFeatureTag(
-  ingredients: AnalysisIngredient[],
-  chartData: Array<{ name: string; value: number }>
-): { tag: string; items: AnalysisIngredient[] }[] {
-  const map = new Map<string, AnalysisIngredient[]>();
-  for (const ing of ingredients) {
-    const tag = String(ing.feature_tag ?? "").trim() || "Untagged";
-    if (!map.has(tag)) map.set(tag, []);
-    map.get(tag)!.push(ing);
-  }
+function dedupeIngredientNames(names: string[]): string[] {
+  const out: string[] = [];
   const seen = new Set<string>();
-  const ordered: string[] = [];
-  for (const row of sortChartDataDesc(chartData)) {
-    if (map.has(row.name) && !seen.has(row.name)) {
-      ordered.push(row.name);
-      seen.add(row.name);
-    }
+  for (const raw of names) {
+    const n = raw.trim();
+    if (!n) continue;
+    const k = n.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(n);
   }
-  const rest = [...map.keys()]
-    .filter((k) => !seen.has(k))
-    .sort((a, b) => a.localeCompare(b));
-  return [...ordered, ...rest].map((tag) => ({
-    tag,
-    items: map.get(tag)!,
-  }));
+  return out;
+}
+
+function buildVerifiedIngredientDirective(
+  category: Category,
+  list: string[]
+): string {
+  const joined = list.join(", ");
+  let text =
+    "Note: The user has manually corrected the ingredient list. IGNORE all previous OCR artifacts and hallucinations. " +
+    "Focus strictly on this updated list: " +
+    joined +
+    ". If a key active ingredient was added, ensure its functional impact is reflected in the safety audit and efficacy summary.";
+  if (category === "supplement") {
+    text +=
+      " [Supplement]: Re-apply DIVIDER_RULE on this ordered list. User-added core actives (vitamins, minerals, botanicals, extracts) must be considered for is_major:true using position/divider heuristics even without dosage on the label.";
+  } else if (category === "skincare" || category === "haircare") {
+    text +=
+      " [Skincare/Haircare]: If the user added preservatives or other high-risk ingredients, downgrade safety_score and safety_audit accordingly.";
+  }
+  return text;
 }
 
 async function enrichAnalysisParamsIfNeeded(
   params: PendingAnalysisParams,
   _signal: AbortSignal
-): Promise<PendingAnalysisParams> {
+): Promise<EnrichedAnalysisParams> {
+  const map = await loadUserCorrectionMap();
   if (params.ingredientText?.trim()) {
-    if (params.ocrRawText?.trim()) return params;
-    const pendingEarly = getPendingImage();
-    if (pendingEarly?.ocrRawText?.trim()) {
-      return { ...params, ocrRawText: pendingEarly.ocrRawText };
-    }
-    return params;
+    const ing = applyOcrCorrectionMapToText(params.ingredientText.trim(), map);
+    let ocrRaw =
+      params.ocrRawText?.trim() ||
+      getPendingImage()?.ocrRawText?.trim() ||
+      undefined;
+    if (ocrRaw) ocrRaw = applyOcrCorrectionMapToText(ocrRaw, map);
+    return {
+      ...params,
+      ingredientText: ing,
+      ...(ocrRaw ? { ocrRawText: ocrRaw } : {}),
+    };
   }
   const pending = getPendingImage();
   if (!pending?.uri || !pending.base64 || !pending.mimeType) return params;
@@ -597,18 +630,28 @@ async function enrichAnalysisParamsIfNeeded(
     uri: pending.uri,
     base64: pending.base64,
   });
-  const ingredientText = detected.correctedText || detected.rawOcrText;
+  let ingredientText = detected.correctedText || detected.rawOcrText;
+  ingredientText = applyOcrCorrectionMapToText(ingredientText, map);
+  let ocrRawText = detected.rawOcrText?.trim() || undefined;
+  if (ocrRawText) ocrRawText = applyOcrCorrectionMapToText(ocrRawText, map);
   const resolved = resolveHintDecision({
     confidenceHint: detected.confidenceHint,
     categoryHint: detected.categoryHint,
     thinkingHint: detected.thinkingHint,
   });
+  const suggestedCategoryHint =
+    (resolved?.categoryHint ?? detected.suggestedCategoryHint) as
+      | EditableCategory
+      | undefined;
+  const needsCategoryConfirm = detected.needsCategoryConfirm;
   return {
     ...params,
     categoryHint: resolved?.categoryHint,
     thinkingHint: resolved?.thinkingHint,
     ingredientText,
-    ocrRawText: detected.rawOcrText?.trim() || undefined,
+    ocrRawText,
+    needsCategoryConfirm,
+    suggestedCategoryHint,
   };
 }
 
@@ -938,9 +981,6 @@ export default function ReportScreen() {
   >(undefined);
   const [disclaimerExpanded, setDisclaimerExpanded] = useState(false);
   const [reportTab, setReportTab] = useState<0 | 1>(0);
-  const [expandedIngredientGroups, setExpandedIngredientGroups] = useState<
-    Set<number>
-  >(() => new Set([0]));
   const [chatHistory, setChatHistory] = useState<string[]>([]);
   const lastLinesRef = useRef<string[]>([]);
   const threadAnchorRef = useRef<{ sessionId: number; base64: string } | null>(
@@ -954,8 +994,24 @@ export default function ReportScreen() {
   const [loadingHighlightKeywords, setLoadingHighlightKeywords] = useState<string[]>([]);
   const [loadingBackgroundUri, setLoadingBackgroundUri] = useState<string | undefined>(undefined);
   const [loadingGotResult, setLoadingGotResult] = useState(false);
+  const [loadingPhase, setLoadingPhase] = useState<LoadingPhase>("compressing");
+  const [loadingExternalProgress, setLoadingExternalProgress] = useState(0);
   const [allDetectedTokens, setAllDetectedTokens] = useState<string[]>([]);
   const [loadingHasData, setLoadingHasData] = useState(false);
+  const [workingIngredients, setWorkingIngredients] = useState<
+    AnalysisIngredient[] | null
+  >(null);
+  const [ingredientModal, setIngredientModal] = useState<
+    null | { mode: "add" } | { mode: "edit"; flatIndex: number }
+  >(null);
+  const [ingredientModalDraft, setIngredientModalDraft] = useState("");
+  const baselineIngredientNamesRef = useRef<string[] | null>(null);
+  const lastCorrectionActionRef = useRef<CorrectionTrackAction | null>(null);
+  const [userInterestMap, setUserInterestMap] = useState<UserInterestMap>({});
+  const [askPlaceholderIngredient, setAskPlaceholderIngredient] = useState<
+    string | null
+  >(null);
+  const ingredientsAnchorYRef = useRef(0);
   const loadingRawPreviewRef = useRef("");
   const pendingLoadingReportRef = useRef<{
     result: AnalysisResult;
@@ -965,6 +1021,7 @@ export default function ReportScreen() {
     ocrRawText?: string;
     thinkingHint?: PendingAnalysisParams["thinkingHint"];
   } | null>(null);
+  const pendingConfirmParamsRef = useRef<EnrichedAnalysisParams | null>(null);
   const commitLoadingSuccessRef = useRef<
     (payload: {
       result: AnalysisResult;
@@ -980,6 +1037,14 @@ export default function ReportScreen() {
     revealTimersRef.current.forEach((timer) => clearTimeout(timer));
     revealTimersRef.current = [];
   };
+
+  const switchLoadingPhase = useCallback((phase: LoadingPhase) => {
+    setLoadingPhase(phase);
+    setLoadingExternalProgress((prev) => {
+      const start = getLoadingPhaseRange(phase).start;
+      return Number.isFinite(prev) ? Math.max(prev, start) : start;
+    });
+  }, []);
 
   const beginRevealSequence = () => {
     clearRevealTimers();
@@ -1030,6 +1095,10 @@ export default function ReportScreen() {
     beginRevealSequence();
     setSafetyAuditUnlocked(false);
     setSafetyScoreUnlocked(false);
+    setWorkingIngredients(null);
+    baselineIngredientNamesRef.current = null;
+    lastCorrectionActionRef.current = null;
+    setAskPlaceholderIngredient(null);
     const initialLines = getExpertAdviceLines(payload.result);
     setChatHistory(initialLines);
     lastLinesRef.current = initialLines;
@@ -1053,8 +1122,12 @@ export default function ReportScreen() {
       clearPendingImage();
     }
     clearAnalysisParams();
+    pendingConfirmParamsRef.current = null;
+    setShowCategoryPicker(false);
     pendingLoadingReportRef.current = null;
     setLoadingGotResult(false);
+    setLoadingPhase("compressing");
+    setLoadingExternalProgress(0);
     setLoadingInitial(false);
   };
   commitLoadingSuccessRef.current = commitLoadingSuccess;
@@ -1066,6 +1139,7 @@ export default function ReportScreen() {
   }, []);
 
   const kickOffLoadingFirstPass = (params: PendingAnalysisParams, signal: AbortSignal) => {
+    switchLoadingPhase("uploading");
     const fallbackTokens = buildFallbackStreamTokens();
     setLoadingStreamTokens([]);
     setLoadingHighlightKeywords([]);
@@ -1096,7 +1170,7 @@ export default function ReportScreen() {
         mergeOcrStreamTokens({
           primary: liveTokens,
           secondary: fallbackTokens,
-          limit: 120,
+          limit: 250,
         })
       );
       setLoadingHighlightKeywords(
@@ -1114,6 +1188,27 @@ export default function ReportScreen() {
       applyRawTokens(raw);
     });
   };
+
+  useEffect(() => {
+    if (!loadingInitial || loadingGotResult) return;
+    const range = getLoadingPhaseRange(loadingPhase);
+    const target = loadingPhase === "finishing" ? 99 : range.end;
+    const timer = setInterval(() => {
+      setLoadingExternalProgress((prev) => {
+        const current = Number.isFinite(prev) ? prev : 0;
+        if (current >= target) return current;
+        const delta = Math.max(0.2, (target - current) * 0.08);
+        return Math.min(target, current + delta);
+      });
+    }, 120);
+    return () => clearInterval(timer);
+  }, [loadingPhase, loadingGotResult, loadingInitial]);
+
+  useEffect(() => {
+    if (loadingInitial) return;
+    setLoadingPhase("compressing");
+    setLoadingExternalProgress(0);
+  }, [loadingInitial]);
 
   const applyResolvedIngredientToLoading = (ingredientText?: string) => {
     const text = ingredientText?.trim() ?? "";
@@ -1167,14 +1262,30 @@ export default function ReportScreen() {
         const { signal } = controllerRef.current;
         pendingLoadingReportRef.current = null;
         setLoadingGotResult(false);
+        setLoadingPhase("uploading");
+        setLoadingExternalProgress(getLoadingPhaseRange("uploading").start);
         setAllDetectedTokens([]);
         setLoadingHasData(false);
         setLoadingInitial(true);
         setInitialError(null);
         kickOffLoadingFirstPass(params, signal);
+        switchLoadingPhase("classifying");
         enrichAnalysisParamsIfNeeded(params, signal)
           .then((resolved) => {
             applyResolvedIngredientToLoading(resolved.ingredientText);
+            if (resolved.needsCategoryConfirm) {
+              pendingConfirmParamsRef.current = resolved;
+              setCategoryOverride(
+                resolved.suggestedCategoryHint ??
+                  resolved.categoryHint ??
+                  "skincare"
+              );
+              setShowCategoryPicker(true);
+              setInitialError(LOW_CONFIDENCE_CATEGORY_MESSAGE);
+              setLoadingInitial(false);
+              return null;
+            }
+            switchLoadingPhase("processing");
             return analyzeImage(
               resolved.base64,
               resolved.mimeType,
@@ -1187,8 +1298,13 @@ export default function ReportScreen() {
             ).then((result) => ({ result, resolved }));
           })
           .then((result) => {
-            if (signal.aborted) return;
+            if (signal.aborted || !result) return;
             const r = result.resolved;
+            const apiIngredientText =
+              result.result.resolvedIngredientText?.trim() || r.ingredientText;
+            const apiOcrRawText =
+              result.result.resolvedOcrRawText?.trim() || r.ocrRawText;
+            applyResolvedIngredientToLoading(apiIngredientText);
             const keySid = r.sessionId ?? getActiveAnalysisSessionId();
             setReport(result.result, {
               sessionId: keySid,
@@ -1200,10 +1316,11 @@ export default function ReportScreen() {
               result: result.result,
               base64: r.base64,
               mimeType: r.mimeType,
-              ingredientText: r.ingredientText,
-              ocrRawText: r.ocrRawText,
+              ingredientText: apiIngredientText,
+              ocrRawText: apiOcrRawText,
               thinkingHint: r.thinkingHint,
             };
+            switchLoadingPhase("finishing");
             setLoadingGotResult(true);
           })
           .catch((e) => {
@@ -1276,13 +1393,56 @@ export default function ReportScreen() {
     }, [])
   );
 
-  const ingredientGroups = useMemo(() => {
-    if (!report) return [];
-    return groupIngredientsByFeatureTag(
-      report.ingredients,
-      report.chartData ?? []
-    );
-  }, [report?.ingredients, report?.chartData]);
+  const sessionImageForAudit =
+    getPendingImage() ?? getLastAnalyzedImage();
+  const ingredientAuditSourceKey =
+    getReportMeta()?.analysisSourceKey ??
+    (sessionImageForAudit
+      ? makeAnalysisSourceKey(
+          sessionImageForAudit.sessionId,
+          sessionImageForAudit.base64
+        )
+      : "");
+
+  const isIngredientListDirty = useMemo(() => {
+    if (!report || workingIngredients == null) return false;
+    const a = report.ingredients.map((i) => i.name.trim());
+    const b = workingIngredients.map((i) => i.name.trim()).filter(Boolean);
+    if (a.length !== b.length) return true;
+    return a.some((n, i) => n !== b[i]);
+  }, [report, workingIngredients]);
+
+  const reportInterestKey = getReportMeta()?.analysisSourceKey;
+  useEffect(() => {
+    let alive = true;
+    void loadUserInterestMap().then((m) => {
+      if (alive) setUserInterestMap(m);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [reportInterestKey]);
+
+  const refreshUserInterestMap = useCallback(() => {
+    void loadUserInterestMap().then(setUserInterestMap);
+  }, []);
+
+  const onExpandedIngredientCard = useCallback(
+    (expanded: boolean, name: string) => {
+      if (!expanded) {
+        setAskPlaceholderIngredient(null);
+        return;
+      }
+      void loadUserInterestMap().then((m) => {
+        setUserInterestMap(m);
+        const ent = m[name.trim()] ?? null;
+        setAskPlaceholderIngredient(
+          shouldUseCuriousPlaceholder(ent) ? name : null
+        );
+      });
+    },
+    []
+  );
 
   const scrollToAdviceSection = useCallback(() => {
     if (Platform.OS === "web") {
@@ -1297,8 +1457,136 @@ export default function ReportScreen() {
       animated: true,
     });
   }, []);
+  const openEditIngredientFlat = useCallback(
+    (flatIndex: number) => {
+      if (!report) return;
+      const next =
+        workingIngredients ?? report.ingredients.map((x) => ({ ...x }));
+      if (workingIngredients == null) {
+        baselineIngredientNamesRef.current = report.ingredients.map((i) =>
+          i.name.trim()
+        );
+      }
+      setWorkingIngredients(next);
+      setIngredientModalDraft(next[flatIndex]?.name?.trim() ?? "");
+      setIngredientModal({ mode: "edit", flatIndex: flatIndex });
+    },
+    [report, workingIngredients]
+  );
 
-  const submitUserQuestion = async (rawQuestion: string): Promise<boolean> => {
+  const openAddIngredient = useCallback(() => {
+    if (!report) return;
+    const productCategory = report.category === "unknown" ? undefined : report.category;
+    AnalyticsService.trackIngredientModified(
+      "add",
+      undefined,
+      undefined,
+      productCategory
+    );
+    const next =
+      workingIngredients ?? report.ingredients.map((x) => ({ ...x }));
+    if (workingIngredients == null) {
+      baselineIngredientNamesRef.current = report.ingredients.map((i) =>
+        i.name.trim()
+      );
+    }
+    setWorkingIngredients(next);
+    setIngredientModalDraft("");
+    setIngredientModal({ mode: "add" });
+  }, [report, workingIngredients]);
+
+  const deleteIngredientFlat = useCallback(
+    (flatIndex: number) => {
+      if (!report) return;
+      const nextBase =
+        workingIngredients ?? report.ingredients.map((x) => ({ ...x }));
+      const originalName = nextBase[flatIndex]?.name?.trim() || undefined;
+      const productCategory = report.category === "unknown" ? undefined : report.category;
+      AnalyticsService.trackIngredientModified(
+        "delete",
+        originalName,
+        undefined,
+        productCategory
+      );
+      if (workingIngredients == null) {
+        baselineIngredientNamesRef.current = report.ingredients.map((i) =>
+          i.name.trim()
+        );
+      }
+      const copy = [...nextBase];
+      copy.splice(flatIndex, 1);
+      setWorkingIngredients(copy);
+      lastCorrectionActionRef.current = "delete";
+    },
+    [report, workingIngredients]
+  );
+
+  const saveIngredientModal = useCallback(async () => {
+    const name = ingredientModalDraft.trim();
+    if (!ingredientModal || !report) {
+      setIngredientModal(null);
+      return;
+    }
+    if (!name) {
+      setIngredientModal(null);
+      return;
+    }
+    if (ingredientModal.mode === "add") {
+      const base =
+        workingIngredients ?? report.ingredients.map((x) => ({ ...x }));
+      if (workingIngredients == null) {
+        baselineIngredientNamesRef.current = report.ingredients.map((i) =>
+          i.name.trim()
+        );
+      }
+      const newIng: AnalysisIngredient = {
+        name,
+        feature_tag: "Base",
+        description: "",
+        is_major: true,
+      };
+      setWorkingIngredients([...base, newIng]);
+      lastCorrectionActionRef.current = "add";
+      const productCategory = report.category === "unknown" ? undefined : report.category;
+      AnalyticsService.trackIngredientModified(
+        "add",
+        undefined,
+        name,
+        productCategory
+      );
+    } else {
+      const idx = ingredientModal.flatIndex;
+      const base =
+        workingIngredients ?? report.ingredients.map((x) => ({ ...x }));
+      if (workingIngredients == null) {
+        baselineIngredientNamesRef.current = report.ingredients.map((i) =>
+          i.name.trim()
+        );
+      }
+      const oldName = base[idx]?.name?.trim() ?? "";
+      if (oldName && oldName !== name) {
+        await mergeCorrectionEntry(oldName, name);
+      }
+      const copy = [...base];
+      copy[idx] = { ...copy[idx], name };
+      setWorkingIngredients(copy);
+      lastCorrectionActionRef.current = "edit";
+      const productCategory = report.category === "unknown" ? undefined : report.category;
+      AnalyticsService.trackIngredientModified(
+        "edit",
+        oldName || undefined,
+        name,
+        productCategory
+      );
+    }
+    setIngredientModal(null);
+  }, [ingredientModal, ingredientModalDraft, report, workingIngredients]);
+
+
+  const submitUserQuestion = async (
+    rawQuestion: string,
+    source: "chip" | "manual" = "manual"
+  ): Promise<boolean> => {
     if (!report || reAnalyzing) return false;
     const userQuestion = rawQuestion.trim();
     if (!userQuestion) return false;
@@ -1317,6 +1605,13 @@ export default function ReportScreen() {
     setReAnalyzing(true);
     const cat = categoryOverride ?? report.category;
     const categoryHint = cat === "unknown" ? undefined : cat;
+    AnalyticsService.trackQuerySubmitted(source, userQuestion, String(cat));
+    if (!categoryHint) {
+      setShowCategoryPicker(true);
+      setReAnalyzeError("请先选择产品类型，再继续提问。");
+      if (categoryOverride == null) setCategoryOverride("skincare");
+      return false;
+    }
     const mergedHint =
       panelThinkingHint ??
       (cat === "supplement" ? ("supplement" as const) : undefined);
@@ -1482,6 +1777,9 @@ export default function ReportScreen() {
       setSafetyScoreUnlocked(false);
       setCategoryOverride(null);
       setShowCategoryPicker(false);
+      setWorkingIngredients(null);
+      baselineIngredientNamesRef.current = null;
+      lastCorrectionActionRef.current = null;
       if (newReport.category !== "unknown") {
         clearPendingImage();
       }
@@ -1499,6 +1797,129 @@ export default function ReportScreen() {
     }
   };
 
+  const handleConfirmReanalyzeFromCorrections = async () => {
+    if (reAnalyzing) return;
+    if (!report || workingIngredients == null || !isIngredientListDirty) return;
+    const names = dedupeIngredientNames(
+      workingIngredients.map((i) => i.name.trim())
+    );
+    if (names.length === 0) {
+      Alert.alert(
+        "Empty list",
+        "Add at least one ingredient before re-analysis."
+      );
+      return;
+    }
+    const ingredientText = names.join(", ");
+    if (ingredientText.length < 12) {
+      Alert.alert("List too short", "Ingredient list is too short to analyze.");
+      return;
+    }
+    const imageForReanalyze = getPendingImage() ?? getLastAnalyzedImage();
+    if (!imageForReanalyze?.base64) {
+      setReAnalyzeError("Image expired, please scan again");
+      return;
+    }
+    const targetCategory: EditableCategory | null =
+      categoryOverride ?? (report.category === "unknown" ? null : report.category);
+    if (!targetCategory) {
+      setReAnalyzeError("请先选择产品类型");
+      setShowCategoryPicker(true);
+      return;
+    }
+    const directive = buildVerifiedIngredientDirective(report.category, names);
+    const before =
+      baselineIngredientNamesRef.current ??
+      report.ingredients.map((i) => i.name.trim());
+    const action: CorrectionTrackAction =
+      lastCorrectionActionRef.current ?? "edit";
+    await appendCorrectionEvent({ before, after: names, action });
+
+    controllerRef.current.abort();
+    controllerRef.current = new AbortController();
+    const { signal } = controllerRef.current;
+    setReAnalyzeError(null);
+    setReAnalyzing(true);
+    clearRevealTimers();
+    setRevealStep(0);
+    try {
+      const reAnalyzeThinkingHint =
+        targetCategory === "supplement" ? "supplement" : undefined;
+      const correctionMap = await loadUserCorrectionMap();
+      const newReport = await analyzeImage(
+        imageForReanalyze.base64,
+        imageForReanalyze.mimeType,
+        signal,
+        targetCategory,
+        reAnalyzeThinkingHint,
+        ingredientText,
+        undefined,
+        imageForReanalyze.ocrRawText,
+        directive,
+        correctionMap
+      );
+      setPanelThinkingHint(reAnalyzeThinkingHint);
+      setReport(newReport, {
+        sessionId: imageForReanalyze.sessionId,
+        isFollowUpResponse: false,
+        thinkingHint: reAnalyzeThinkingHint,
+        analysisSourceKey: makeAnalysisSourceKey(
+          imageForReanalyze.sessionId,
+          imageForReanalyze.base64
+        ),
+      });
+      setReportState(newReport);
+      const reLines = getExpertAdviceLines(newReport);
+      setChatHistory(reLines);
+      lastLinesRef.current = reLines;
+      chatSessionForStorageRef.current = imageForReanalyze.sessionId;
+      threadAnchorRef.current = {
+        sessionId: imageForReanalyze.sessionId,
+        base64: imageForReanalyze.base64,
+      };
+      setLastAnalyzedImage({
+        uri: imageForReanalyze.uri,
+        base64: imageForReanalyze.base64,
+        mimeType: imageForReanalyze.mimeType,
+        ingredientText,
+        ocrRawText: imageForReanalyze.ocrRawText,
+      });
+      try {
+        if (typeof sessionStorage !== "undefined") {
+          sessionStorage.removeItem(
+            `${CHAT_STORAGE_PREFIX}${imageForReanalyze.sessionId}`
+          );
+        }
+      } catch {
+        /* ignore */
+      }
+      beginRevealSequence();
+      setSafetyAuditUnlocked(false);
+      setSafetyScoreUnlocked(false);
+      setWorkingIngredients(null);
+      baselineIngredientNamesRef.current = null;
+      lastCorrectionActionRef.current = null;
+      setCategoryOverride(null);
+      setShowCategoryPicker(false);
+      if (newReport.category !== "unknown") {
+        clearPendingImage();
+      }
+    } catch (e) {
+      if (e instanceof Error && e.name === "AbortError") return;
+      const hr = getHighRiskIngredientFromError(e);
+      if (hr) {
+        setHighRiskIngredientName(hr);
+        setHighRiskModalVisible(true);
+        return;
+      }
+      setReAnalyzeError(
+        e instanceof Error ? e.message : "Re-analysis failed"
+      );
+    } finally {
+      setReAnalyzing(false);
+    }
+  };
+
   const handleInitialRetry = async () => {
     const params = getAnalysisParams();
     if (!params) return;
@@ -1507,6 +1928,8 @@ export default function ReportScreen() {
     const { signal } = controllerRef.current;
     pendingLoadingReportRef.current = null;
     setLoadingGotResult(false);
+    setLoadingPhase("uploading");
+    setLoadingExternalProgress(getLoadingPhaseRange("uploading").start);
     setAllDetectedTokens([]);
     setLoadingHasData(false);
     setInitialError(null);
@@ -1514,9 +1937,21 @@ export default function ReportScreen() {
     clearRevealTimers();
     setRevealStep(0);
     kickOffLoadingFirstPass(params, signal);
+    switchLoadingPhase("classifying");
     try {
       const resolved = await enrichAnalysisParamsIfNeeded(params, signal);
       applyResolvedIngredientToLoading(resolved.ingredientText);
+      if (resolved.needsCategoryConfirm) {
+        pendingConfirmParamsRef.current = resolved;
+        setCategoryOverride(
+          resolved.suggestedCategoryHint ?? resolved.categoryHint ?? "skincare"
+        );
+        setShowCategoryPicker(true);
+        setInitialError(LOW_CONFIDENCE_CATEGORY_MESSAGE);
+        setLoadingInitial(false);
+        return;
+      }
+      switchLoadingPhase("processing");
       const result = await analyzeImage(
         resolved.base64,
         resolved.mimeType,
@@ -1543,6 +1978,84 @@ export default function ReportScreen() {
         ocrRawText: resolved.ocrRawText,
         thinkingHint: resolved.thinkingHint,
       };
+      switchLoadingPhase("finishing");
+      setLoadingGotResult(true);
+    } catch (e) {
+      if (e instanceof Error && e.name === "AbortError") return;
+      pendingLoadingReportRef.current = null;
+      setLoadingGotResult(false);
+      const hr = getHighRiskIngredientFromError(e);
+      if (hr) {
+        setHighRiskIngredientName(hr);
+        setHighRiskModalVisible(true);
+        return;
+      }
+      setInitialError(e instanceof Error ? e.message : "Analysis failed");
+    } finally {
+      if (signal.aborted) return;
+      if (!pendingLoadingReportRef.current) {
+        setLoadingInitial(false);
+      }
+    }
+  };
+
+  const handleInitialCategoryConfirm = async () => {
+    const pending = pendingConfirmParamsRef.current;
+    if (!pending) return;
+    const categoryHint: EditableCategory =
+      categoryOverride ?? pending.suggestedCategoryHint ?? "skincare";
+    const thinkingHint: PendingAnalysisParams["thinkingHint"] =
+      categoryHint === "supplement"
+        ? "supplement"
+        : categoryHint === "skincare" &&
+            (pending.thinkingHint === "essence" || pending.thinkingHint === "cream")
+          ? pending.thinkingHint
+          : undefined;
+    controllerRef.current.abort();
+    controllerRef.current = new AbortController();
+    const { signal } = controllerRef.current;
+    pendingLoadingReportRef.current = null;
+    setLoadingGotResult(false);
+    setLoadingPhase("uploading");
+    setLoadingExternalProgress(getLoadingPhaseRange("uploading").start);
+    setAllDetectedTokens([]);
+    setLoadingHasData(false);
+    setInitialError(null);
+    setLoadingInitial(true);
+    setShowCategoryPicker(false);
+    clearRevealTimers();
+    setRevealStep(0);
+    kickOffLoadingFirstPass(pending, signal);
+    applyResolvedIngredientToLoading(pending.ingredientText);
+    try {
+      switchLoadingPhase("processing");
+      const result = await analyzeImage(
+        pending.base64,
+        pending.mimeType,
+        signal,
+        categoryHint,
+        thinkingHint,
+        pending.ingredientText,
+        undefined,
+        pending.ocrRawText
+      );
+      if (signal.aborted) return;
+      const sid = pending.sessionId ?? getActiveAnalysisSessionId();
+      setReport(result, {
+        sessionId: sid,
+        isFollowUpResponse: false,
+        thinkingHint,
+        analysisSourceKey: makeAnalysisSourceKey(sid, pending.base64),
+      });
+      pendingLoadingReportRef.current = {
+        result,
+        base64: pending.base64,
+        mimeType: pending.mimeType,
+        ingredientText: pending.ingredientText,
+        ocrRawText: pending.ocrRawText,
+        thinkingHint,
+      };
+      switchLoadingPhase("finishing");
       setLoadingGotResult(true);
     } catch (e) {
       if (e instanceof Error && e.name === "AbortError") return;
@@ -1615,6 +2128,8 @@ export default function ReportScreen() {
                 hasData: loadingHasData,
                 highlightKeywords: loadingHighlightKeywords,
                 backgroundImageUri: loadingBackgroundUri,
+                phase: loadingPhase,
+                externalProgress: loadingExternalProgress,
               } as any)}
             />
           </View>
@@ -1632,7 +2147,44 @@ export default function ReportScreen() {
           <Text style={styles.emptyText}>
             {initialError ? initialError : "No report"}
           </Text>
-          {initialError ? (
+          {showCategoryPicker && pendingConfirmParamsRef.current ? (
+            <View style={styles.categoryPickerWrap}>
+              <View style={styles.categoryRow}>
+                {(["skincare", "supplement", "haircare"] as const).map((cat) => (
+                  <Pressable
+                    key={cat}
+                    onPress={() => {
+                      const detectedType =
+                        pendingConfirmParamsRef.current?.suggestedCategoryHint ??
+                        "unknown";
+                      AnalyticsService.trackCategoryCorrected(detectedType, cat);
+                      setCategoryOverride(cat);
+                      setReAnalyzeError(null);
+                    }}
+                    style={[
+                      styles.categoryOption,
+                      categoryOverride === cat && styles.categoryOptionSelected,
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.categoryOptionText,
+                        categoryOverride === cat && styles.categoryOptionTextSelected,
+                      ]}
+                    >
+                      {CATEGORY_LABELS[cat]}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+              <Pressable
+                onPress={handleInitialCategoryConfirm}
+                style={styles.reanalyzeButton}
+              >
+                <Text style={styles.reanalyzeButtonText}>Continue Analysis</Text>
+              </Pressable>
+            </View>
+          ) : initialError ? (
             <Pressable onPress={handleInitialRetry} style={styles.retryButton}>
               <Text style={styles.retryButtonText}>Retry</Text>
             </Pressable>
@@ -1691,14 +2243,6 @@ export default function ReportScreen() {
   const { totalWeight: safetyBinTotalWeight, binPercents: safetyBinPercents } =
     computeSafetyScoreWeightedBinPercents(report.ingredients);
 
-  const toggleIngredientGroup = (gi: number) => {
-    setExpandedIngredientGroups((prev) => {
-      const next = new Set(prev);
-      if (next.has(gi)) next.delete(gi);
-      else next.add(gi);
-      return next;
-    });
-  };
   const rawCoreTags =
     report.coreTags ??
     (report as unknown as { mainEffects?: string[] }).mainEffects ??
@@ -1778,10 +2322,6 @@ export default function ReportScreen() {
         ? "🤯 overload formula"
         : "";
 
-  const activeThinkingHint =
-    panelThinkingHint ??
-    (report.category === "supplement" ? ("supplement" as const) : undefined);
-
   return (
     <View style={[styles.container, { backgroundColor: BG }]}>
       <ScrollView
@@ -1820,6 +2360,7 @@ export default function ReportScreen() {
                     <Pressable
                       key={cat}
                       onPress={() => {
+                        AnalyticsService.trackCategoryCorrected(report.category, cat);
                         setCategoryOverride(cat);
                         setReAnalyzeError(null);
                       }}
@@ -2391,24 +2932,59 @@ export default function ReportScreen() {
                 />
               )}
 
-            <IngredientSection
-              category={report.category}
-              ingredientGroups={ingredientGroups}
-              expandedIngredientGroups={expandedIngredientGroups}
-              onToggleGroup={toggleIngredientGroup}
-              isSafetyScoreUnlocked={isSafetyScoreUnlocked}
-              styles={{
-                sectionTitle: styles.sectionTitle,
-                ingredientHint: styles.ingredientHint,
-                card: styles.card,
-                cardText: styles.cardText,
-                ingredientGroupDrawer: styles.ingredientGroupDrawer,
-                ingredientGroupSpaced: styles.ingredientGroupSpaced,
-                ingredientGroupHeader: styles.ingredientGroupHeader,
-                ingredientGroupTitle: styles.ingredientGroupTitle,
-                ingredientGroupContent: styles.ingredientGroupContent,
+            <View
+              onLayout={(e) => {
+                ingredientsAnchorYRef.current = e.nativeEvent.layout.y;
               }}
-            />
+            >
+              <IngredientAuditList
+                category={report.category}
+                ingredients={workingIngredients ?? report.ingredients}
+                showSafetyScore={isSafetyScoreUnlocked}
+                analysisSourceKey={ingredientAuditSourceKey}
+                base64Image={sessionImageForAudit?.base64 ?? ""}
+                mimeType={sessionImageForAudit?.mimeType ?? "image/jpeg"}
+                interestByName={userInterestMap}
+                editable={report.category !== "unknown"}
+                onEditFlatIndex={openEditIngredientFlat}
+                onDeleteFlatIndex={deleteIngredientFlat}
+                onPressAddMissing={openAddIngredient}
+                onExpandedCardChange={onExpandedIngredientCard}
+                onInterestUpdated={refreshUserInterestMap}
+                onRequestScrollToListY={(yInList) => {
+                  reportScrollRef.current?.scrollTo({
+                    y: Math.max(
+                      0,
+                      ingredientsAnchorYRef.current + yInList - 24
+                    ),
+                    animated: true,
+                  });
+                }}
+              />
+            </View>
+            {workingIngredients != null && isIngredientListDirty ? (
+              <View style={styles.confirmReanalyzeFromListWrap}>
+                <Pressable
+                  onPress={handleConfirmReanalyzeFromCorrections}
+                  disabled={reAnalyzing}
+                  style={[
+                    styles.confirmReanalyzeFromListButton,
+                    reAnalyzing && styles.reanalyzeButtonDisabled,
+                  ]}
+                >
+                  {reAnalyzing ? (
+                    <ActivityIndicator size="small" color="#fff" />
+                  ) : (
+                    <Text style={styles.reanalyzeButtonText}>
+                      Confirm & Re-analyze
+                    </Text>
+                  )}
+                </Pressable>
+                {reAnalyzeError ? (
+                  <Text style={styles.reanalyzeError}>{reAnalyzeError}</Text>
+                ) : null}
+              </View>
+            ) : null}
           </>
         )}
 
@@ -2446,15 +3022,62 @@ export default function ReportScreen() {
         <View style={styles.scrollBottomSpacer} />
       </ScrollView>
       <AskPanel
-        thinkingHint={activeThinkingHint}
+        productCategory={currentCategory ?? "skincare"}
         language="cn"
         disabled={reAnalyzing}
         onSend={submitUserQuestion}
-        extraChips={[
-          { label: "🔍Wrong Detect？", query: CHIP_MISTAKE },
-          { label: "🤰 Can I use it when pregnant？", query: CHIP_PREGNANCY },
-        ]}
+        inputPlaceholderOverride={
+          askPlaceholderIngredient
+            ? `Still curious about ${askPlaceholderIngredient}? Ask for more details...`
+            : null
+        }
       />
+      <Modal
+        visible={ingredientModal != null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setIngredientModal(null)}
+      >
+        <View style={styles.ingredientModalBackdrop}>
+          <Pressable
+            style={[
+              StyleSheet.absoluteFillObject,
+              { backgroundColor: "rgba(0,0,0,0.45)" },
+            ]}
+            onPress={() => setIngredientModal(null)}
+          />
+          <View style={styles.ingredientModalCard}>
+            <Text style={styles.ingredientModalTitle}>
+              {ingredientModal?.mode === "add"
+                ? "Add ingredient"
+                : "Edit ingredient"}
+            </Text>
+            <TextInput
+              value={ingredientModalDraft}
+              onChangeText={setIngredientModalDraft}
+              placeholder="INCI / name"
+              placeholderTextColor={TEXT_MUTED}
+              style={styles.ingredientModalInput}
+              autoFocus
+              autoCorrect={false}
+            />
+            <View style={styles.ingredientModalActions}>
+              <Pressable
+                onPress={() => setIngredientModal(null)}
+                style={styles.ingredientModalCancel}
+              >
+                <Text style={styles.ingredientModalCancelText}>Cancel</Text>
+              </Pressable>
+              <Pressable
+                onPress={() => void saveIngredientModal()}
+                style={styles.ingredientModalSave}
+              >
+                <Text style={styles.ingredientModalSaveText}>Save</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
       <HighRiskModal
         visible={highRiskModalVisible}
         ingredient={highRiskIngredientName}
@@ -2679,6 +3302,69 @@ const styles = StyleSheet.create({
     color: "#f87171",
     fontSize: 14,
     marginTop: 8,
+  },
+  confirmReanalyzeFromListWrap: {
+    marginTop: 20,
+    marginBottom: MODULE_GAP,
+    alignSelf: "stretch",
+  },
+  confirmReanalyzeFromListButton: {
+    backgroundColor: "#7c3aed",
+    paddingVertical: 14,
+    borderRadius: 10,
+    alignItems: "center",
+  },
+  ingredientModalBackdrop: {
+    flex: 1,
+    justifyContent: "center",
+    padding: 24,
+  },
+  ingredientModalCard: {
+    backgroundColor: CARD_BG,
+    borderRadius: 14,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: CARD_BORDER,
+  },
+  ingredientModalTitle: {
+    fontSize: 17,
+    fontWeight: "700",
+    color: TEXT_PRIMARY,
+    marginBottom: 12,
+  },
+  ingredientModalInput: {
+    borderWidth: 1,
+    borderColor: THEME_BORDER,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 16,
+    color: TEXT_PRIMARY,
+    marginBottom: 18,
+  },
+  ingredientModalActions: {
+    flexDirection: "row",
+    justifyContent: "flex-end",
+    gap: 12,
+  },
+  ingredientModalCancel: {
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+  },
+  ingredientModalCancelText: {
+    color: TEXT_SECONDARY,
+    fontSize: 16,
+  },
+  ingredientModalSave: {
+    backgroundColor: THEME,
+    paddingVertical: 10,
+    paddingHorizontal: 18,
+    borderRadius: 8,
+  },
+  ingredientModalSaveText: {
+    color: "#fff",
+    fontSize: 16,
+    fontWeight: "600",
   },
   sectionPlain: {
     marginBottom: MODULE_GAP,

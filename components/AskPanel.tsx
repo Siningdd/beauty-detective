@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  Animated,
   View,
   Text,
   TextInput,
@@ -10,91 +11,120 @@ import {
   StyleSheet,
   ActivityIndicator,
   useWindowDimensions,
+  Vibration,
 } from "react-native";
-import type { PendingAnalysisParams } from "../services/store";
 import MaterialCommunityIcons from "@expo/vector-icons/MaterialCommunityIcons";
+import {
+  INTENT_MINI_CHIPS,
+  type IntentProductCategory,
+  type IntentMiniChip,
+} from "../constants/intentQuestions";
+import {
+  getFavChipForCategory,
+  trackCategoryOpen,
+  trackQuestionSelect,
+} from "../services/localStats";
 
 const SEND_PURPLE = "#7C3AED";
 const SEND_PURPLE_MUTED = "#C4B5FD";
-
-type PillConfig = { cn: string[]; de: string[] };
-
-const PILL_CONFIG: Record<
-  "essence" | "cream" | "supplement" | "default",
-  PillConfig
-> = {
-  essence: {
-    cn: ["How to layer?", "Sensitive skin safe?", "Daytime use?"],
-    de: ["Anwendung?", "Für sensible Haut?", "Tagespflege?"],
-  },
-  cream: {
-    cn: ["Does it pill", "Is it greasy?", "Too heavy?"],
-    de: ["Krümelt es?", "Fettig?", "Okklusiv?"],
-  },
-  supplement: {
-    cn: ["How to take it?", "Before or after meal?", "Any conflicts?"],
-    de: ["Einnahme?", "Vor/nach Essen?", "Wechselwirkungen?"],
-  },
-  default: {
-    cn: ["Side effects?", "Is it for me?", "Safe ingredients?"],
-    de: ["Nebenwirkungen?", "Für mich?", "Inhaltsstoffe?"],
-  },
-};
-
-type ExtraChip = { label: string; query: string };
+const DRAWER_EXPANDED_HEIGHT = 240;
 
 type Props = {
-  thinkingHint?: PendingAnalysisParams["thinkingHint"];
+  productCategory: IntentProductCategory;
   language?: "cn" | "de";
   disabled?: boolean;
-  onSend: (text: string) => Promise<boolean>;
-  extraChips?: ExtraChip[];
+  onSend: (text: string, source: "chip" | "manual") => Promise<boolean>;
+  /** When set, replaces default Ask placeholder (local intelligence). */
+  inputPlaceholderOverride?: string | null;
 };
 
 export function AskPanel({
-  thinkingHint,
+  productCategory,
   language = "cn",
   disabled = false,
   onSend,
-  extraChips = [],
+  inputPlaceholderOverride,
 }: Props) {
   const [text, setText] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [activeChipId, setActiveChipId] = useState<string | null>(null);
+  const [favChipId, setFavChipId] = useState<string | null>(null);
+  const drawerAnim = useRef(new Animated.Value(0)).current;
   const { width: windowWidth } = useWindowDimensions();
 
   const busy = disabled || submitting;
+  const chips = INTENT_MINI_CHIPS[productCategory] ?? INTENT_MINI_CHIPS.skincare;
 
-  const pillKey: keyof typeof PILL_CONFIG =
-    thinkingHint === "essence" ||
-    thinkingHint === "cream" ||
-    thinkingHint === "supplement"
-      ? thinkingHint
-      : "default";
-  const starterLines =
-    language === "de" ? PILL_CONFIG[pillKey].de : PILL_CONFIG[pillKey].cn;
+  useEffect(() => {
+    let alive = true;
+    void getFavChipForCategory(productCategory).then((fav) => {
+      if (!alive) return;
+      setFavChipId(fav);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [productCategory]);
+
+  useEffect(() => {
+    Animated.timing(drawerAnim, {
+      toValue: activeChipId ? 1 : 0,
+      duration: 220,
+      useNativeDriver: false,
+    }).start();
+  }, [activeChipId, drawerAnim]);
 
   const webLarge = Platform.OS === "web" && windowWidth > 768;
   const columnMaxWidth = webLarge
     ? Math.min(windowWidth * 0.7, 768)
     : undefined;
 
-  const handleSend = async (content: string) => {
+  const orderedChips = useMemo(() => {
+    if (!favChipId) return chips;
+    const fav = chips.find((c) => c.id === favChipId);
+    if (!fav) return chips;
+    return [fav, ...chips.filter((c) => c.id !== fav.id)];
+  }, [chips, favChipId]);
+
+  const activeChip =
+    orderedChips.find((chip) => chip.id === activeChipId) ??
+    chips.find((chip) => chip.id === activeChipId) ??
+    null;
+  const drawerMaxHeight = drawerAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0, DRAWER_EXPANDED_HEIGHT],
+  });
+
+  const handleSend = async (content: string, source: "chip" | "manual") => {
     if (busy) return;
     const trimmed = content.trim();
     if (!trimmed) return;
     setSubmitting(true);
     try {
-      const success = await onSend(trimmed);
+      const success = await onSend(trimmed, source);
       if (success) setText("");
     } finally {
       setSubmitting(false);
     }
   };
+  const onMiniChipPress = (chip: IntentMiniChip) => {
+    if (busy) return;
+    Vibration.vibrate(10);
+    const shouldOpen = activeChipId !== chip.id;
+    setActiveChipId((prev) => (prev === chip.id ? null : chip.id));
+    if (!shouldOpen) return;
+    void trackCategoryOpen(productCategory, chip.id).then((result) => {
+      if (result.favChipId) setFavChipId(result.favChipId);
+    });
+  };
 
-  const pillNodes = [
-    ...extraChips.map((c) => ({ key: `x-${c.label}`, label: c.label, q: c.query })),
-    ...starterLines.map((p, i) => ({ key: `s-${i}-${p}`, label: p, q: p })),
-  ];
+  const onQuestionPress = (question: string) => {
+    if (busy || !activeChip) return;
+    const selectedChip = activeChip;
+    setActiveChipId(null);
+    void trackQuestionSelect(productCategory, selectedChip.id, question);
+    void handleSend(question, "chip");
+  };
 
   const kavBehavior = Platform.OS === "ios" ? "padding" : undefined;
   const kavOffset = Platform.OS === "ios" ? 90 : 0;
@@ -118,21 +148,61 @@ export function AskPanel({
               contentContainerStyle={styles.pillsScroll}
               keyboardShouldPersistTaps="handled"
             >
-              {pillNodes.map((p) => (
+              {orderedChips.map((chip) => (
                 <Pressable
-                  key={p.key}
+                  key={chip.id}
                   style={({ pressed }) => [
-                    styles.pill,
-                    busy && styles.pillDisabled,
-                    pressed && !busy && styles.pillPressed,
+                    styles.miniChip,
+                    favChipId === chip.id && styles.miniChipFav,
+                    activeChipId === chip.id && styles.miniChipActive,
+                    busy && styles.miniChipDisabled,
+                    pressed && !busy && styles.miniChipPressed,
                   ]}
                   disabled={busy}
-                  onPress={() => void handleSend(p.q)}
+                  onPress={() => onMiniChipPress(chip)}
                 >
-                  <Text style={styles.pillText}>{p.label}</Text>
+                  <Text style={styles.miniChipIcon}>{chip.icon}</Text>
+                  <Text style={styles.miniChipText}>{chip.label}</Text>
                 </Pressable>
               ))}
             </ScrollView>
+            <Animated.View
+              style={[
+                styles.drawerAnimatedWrap,
+                {
+                  maxHeight: drawerMaxHeight,
+                  opacity: drawerAnim,
+                },
+              ]}
+            >
+              <View style={styles.drawerCard}>
+                {activeChip ? (
+                  <>
+                    <Text style={styles.drawerTitle}>
+                      {activeChip.icon} {activeChip.label}
+                    </Text>
+                    {activeChip.questions.map((question) => (
+                      <Pressable
+                        key={`${activeChip.id}-${question}`}
+                        style={({ pressed }) => [
+                          styles.questionRow,
+                          pressed && styles.questionRowPressed,
+                        ]}
+                        disabled={busy}
+                        onPress={() => onQuestionPress(question)}
+                      >
+                        <Text style={styles.questionText}>{question}</Text>
+                        <MaterialCommunityIcons
+                          name="chevron-right"
+                          size={18}
+                          color="#6B7280"
+                        />
+                      </Pressable>
+                    ))}
+                  </>
+                ) : null}
+              </View>
+            </Animated.View>
           </View>
 
           <View style={styles.capsuleRow} pointerEvents="auto">
@@ -146,9 +216,11 @@ export function AskPanel({
                 <TextInput
                   style={[styles.input, busy && styles.inputDisabled]}
                   placeholder={
-                    language === "de"
-                      ? "Fragen..."
-                      : "🎁 Limited Offer: Pro Expert Q&A is Free Today"
+                    inputPlaceholderOverride?.trim()
+                      ? inputPlaceholderOverride.trim()
+                      : language === "de"
+                        ? "Fragen..."
+                        : "🎁 Limited Offer: Pro Expert Q&A is Free Today"
                   }
                   placeholderTextColor="#9AA0A6"
                   multiline
@@ -169,7 +241,7 @@ export function AskPanel({
                   },
                 ]}
                 disabled={busy || !text.trim()}
-                onPress={() => void handleSend(text)}
+                onPress={() => void handleSend(text, "manual")}
               >
                 {busy ? (
                   <>
@@ -228,12 +300,9 @@ const styles = StyleSheet.create({
   },
   pillsBlock: {
     marginBottom: 10,
-    maxHeight: 52,
-    overflow: "hidden",
   },
   pillsScrollHost: {
     flexGrow: 0,
-    maxHeight: 52,
   },
   pillsScroll: {
     flexDirection: "row",
@@ -242,10 +311,12 @@ const styles = StyleSheet.create({
     flexWrap: "nowrap",
     gap: 8,
   },
-  pill: {
+  miniChip: {
+    flexDirection: "row",
+    alignItems: "center",
     backgroundColor: "#FFFFFF",
     borderRadius: 20,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingVertical: 8,
     marginRight: 8,
     borderWidth: 1,
@@ -266,9 +337,60 @@ const styles = StyleSheet.create({
         } as object)
       : {}),
   },
-  pillDisabled: { opacity: 0.5 },
-  pillPressed: { opacity: 0.85 },
-  pillText: { fontSize: 13, color: "#3C4043", fontWeight: "500" },
+  miniChipFav: {
+    borderColor: "#C4B5FD",
+    backgroundColor: "#F5F3FF",
+  },
+  miniChipActive: {
+    borderColor: "#8B5CF6",
+    backgroundColor: "#F3F0FF",
+  },
+  miniChipDisabled: { opacity: 0.5 },
+  miniChipPressed: { opacity: 0.85 },
+  miniChipIcon: {
+    fontSize: 12,
+    marginRight: 6,
+  },
+  miniChipText: { fontSize: 13, color: "#3C4043", fontWeight: "600" },
+  drawerAnimatedWrap: {
+    overflow: "hidden",
+    marginTop: 8,
+  },
+  drawerCard: {
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#E8EAED",
+    backgroundColor: "#FFFFFF",
+    paddingVertical: 6,
+  },
+  drawerTitle: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#111827",
+    paddingHorizontal: 12,
+    paddingTop: 6,
+    paddingBottom: 8,
+  },
+  questionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: "#ECEFF3",
+  },
+  questionRowPressed: {
+    backgroundColor: "#F8FAFC",
+  },
+  questionText: {
+    flex: 1,
+    fontSize: 13,
+    lineHeight: 18,
+    color: "#1F2937",
+    fontWeight: "500",
+  },
   capsuleRow: {
     width: "100%",
   },

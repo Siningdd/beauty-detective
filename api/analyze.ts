@@ -5,6 +5,8 @@
 import { GoogleGenAI } from "@google/genai";
 import {
   getAnalysisPrompt,
+  getAnalysisPromptBaseConstant,
+  getClassifyCategoryPrompt,
 } from "./prompts.js";
 import type {
   AnalysisResult,
@@ -47,7 +49,7 @@ const NO_ACTIONS_TAGS = new Set<string>([
   "Flavor/Fragrance",
 ]);
 
-const IMAGE_MODEL = "gemini-2.0-flash-lite-001";
+const IMAGE_MODEL = "gemini-2.5-flash";
 
 /** Shared generation defaults (maps to REST generationConfig). */
 const DEFAULT_GENERATE_CONTENT_CONFIG = {
@@ -67,22 +69,22 @@ type CacheEntry = {
   expiresAt: number;
 };
 
+type AnalysisCacheSlot = "skincare" | "supplement";
+
 type ActiveCache = {
-  analysis?: CacheEntry;
+  analysis?: Partial<Record<AnalysisCacheSlot, CacheEntry>>;
 };
 
 // Local in-memory cache (per server instance).
 // Cached-content itself is server-side; this avoids re-creating the cache object.
 let activeCache: ActiveCache = {};
 let cacheInFlight: {
-  analysis?: Promise<CacheEntry>;
+  analysis?: Partial<Record<AnalysisCacheSlot, Promise<CacheEntry>>>;
 } = {};
 
 function isCacheEntryValid(entry?: CacheEntry): boolean {
   return !!entry && entry.expiresAt > Date.now();
 }
-
-const ANALYSIS_SYSTEM_INSTRUCTION_BASE = getAnalysisPrompt();
 
 function getPromptSuffix(base: string, full: string): string {
   if (full.startsWith(base)) return full.slice(base.length).trim();
@@ -91,17 +93,19 @@ function getPromptSuffix(base: string, full: string): string {
 
 async function getOrCreateCache(
   ai: GoogleGenAI,
-  kind: "analysis"
+  kind: "analysis",
+  slot: AnalysisCacheSlot
 ): Promise<CacheEntry> {
-  const existing = activeCache.analysis;
+  const existing = activeCache.analysis?.[slot];
   if (isCacheEntryValid(existing)) return existing!;
 
-  const inflight = cacheInFlight.analysis;
+  const inflight = cacheInFlight.analysis?.[slot];
   if (inflight) return inflight;
 
   const promise = (async (): Promise<CacheEntry> => {
-    const systemInstruction = ANALYSIS_SYSTEM_INSTRUCTION_BASE;
-    const displayName = "beauty-detective:analysis-system-v1";
+    const categoryForBase = slot === "supplement" ? "supplement" : "skincare";
+    const systemInstruction = getAnalysisPromptBaseConstant(categoryForBase);
+    const displayName = `beauty-detective:analysis-system-v1-${slot}`;
 
     const cache = await ai.caches.create({
       model: IMAGE_MODEL,
@@ -120,18 +124,24 @@ async function getOrCreateCache(
       expiresAt: Date.now() + CONTEXT_CACHE_TTL_MS,
     };
 
-    activeCache.analysis = entry;
+    activeCache.analysis = { ...activeCache.analysis, [slot]: entry };
     return entry;
   })();
 
-  cacheInFlight.analysis = promise;
+  cacheInFlight.analysis = {
+    ...(cacheInFlight.analysis ?? {}),
+    [slot]: promise,
+  };
 
   try {
     const entry = await promise;
     return entry;
   } finally {
-    // Clear in-flight marker regardless of success/failure.
-    cacheInFlight.analysis = undefined;
+    const map = cacheInFlight.analysis;
+    if (map?.[slot] === promise) {
+      const { [slot]: _removed, ...rest } = map;
+      cacheInFlight.analysis = Object.keys(rest).length ? rest : undefined;
+    }
   }
 }
 
@@ -262,6 +272,55 @@ const ANALYSIS_RESPONSE_SCHEMA = {
 };
 
 type CategoryHintArg = "skincare" | "supplement" | "haircare";
+type CategoryConfidence = "high" | "medium" | "low";
+export type CategoryClassifyResult = {
+  category: Category;
+  confidence: CategoryConfidence;
+  reason: string;
+};
+
+const CATEGORY_CLASSIFY_RESPONSE_SCHEMA = {
+  type: "object",
+  properties: {
+    category: {
+      type: "string",
+      enum: ["skincare", "supplement", "haircare", "unknown"],
+    },
+    confidence: {
+      type: "string",
+      enum: ["high", "medium", "low"],
+    },
+    reason: { type: "string" },
+  },
+  required: ["category", "confidence"],
+};
+
+function normalizeCategoryValue(raw: unknown): Category {
+  const categoryVal =
+    typeof raw === "string"
+      ? raw.toLowerCase().trim().replace(/\s+/g, "")
+      : "";
+  if (categoryVal === "skincare" || categoryVal === "supplement") {
+    return categoryVal;
+  }
+  if (categoryVal === "haircare" || categoryVal === "hairproduct") {
+    return "haircare";
+  }
+  return "unknown";
+}
+
+function normalizeCategoryConfidence(raw: unknown): CategoryConfidence {
+  if (typeof raw !== "string") return "low";
+  const v = raw.trim().toLowerCase();
+  if (v === "high" || v === "medium" || v === "low") return v;
+  return "low";
+}
+
+function toPromptCategory(category: Category): NormalizedCategoryHint {
+  if (category === "supplement") return "supplement";
+  if (category === "haircare") return "haircare";
+  return "skincare";
+}
 
 /** Gemini response schema; supplement hint forces integer absorption + irritation in dynamic_details. */
 function getAnalysisResponseSchema(categoryHint?: CategoryHintArg): object {
@@ -1366,31 +1425,97 @@ function shouldEnableThinking(
   );
 }
 
+export async function classifyProductCategory(
+  base64Image: string,
+  mimeType: string = "image/jpeg",
+  ingredientText?: string
+): Promise<CategoryClassifyResult> {
+  if (!GEMINI_API_KEY) {
+    throw new Error("请在 .env 中配置 GEMINI_API_KEY 或 GOOGLE_API_KEY");
+  }
+  const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+  const prompt = getClassifyCategoryPrompt();
+  const normalizedIngredientText =
+    typeof ingredientText === "string" ? ingredientText.trim() : "";
+  const hasIngredientText = normalizedIngredientText.length >= 8;
+
+  const response = await ai.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: [
+      {
+        inlineData: {
+          mimeType,
+          data: base64Image,
+        },
+      },
+      {
+        text:
+          prompt +
+          (hasIngredientText
+            ? "\n\nINPUT_OCR_TEXT=" + JSON.stringify(normalizedIngredientText)
+            : ""),
+      },
+    ],
+    config: {
+      ...DEFAULT_GENERATE_CONTENT_CONFIG,
+      responseJsonSchema: CATEGORY_CLASSIFY_RESPONSE_SCHEMA,
+      thinkingConfig: pickThinkingConfig(false),
+    },
+  });
+
+  const text = response.text;
+  if (!text) {
+    return { category: "unknown", confidence: "low", reason: "empty classify output" };
+  }
+  const raw = parseJsonObject(text);
+  return {
+    category: normalizeCategoryValue(raw.category),
+    confidence: normalizeCategoryConfidence(raw.confidence),
+    reason: String(raw.reason ?? "").trim(),
+  };
+}
+
 export async function analyzeCosmeticImage(
   base64Image: string,
   mimeType: string = "image/jpeg",
   categoryHint?: CategoryHintInput,
   thinkingHint?: ThinkingHint,
   ingredientText?: string,
-  userQuestion?: string
+  userQuestion?: string,
+  verifiedIngredientDirective?: string
 ): Promise<AnalysisResult> {
   if (!GEMINI_API_KEY) {
     throw new Error("请在 .env 中配置 GEMINI_API_KEY 或 GOOGLE_API_KEY");
   }
 
   const normalizedCategoryHint = normalizeCategoryHint(categoryHint);
-  const useThinking = shouldEnableThinking(categoryHint, thinkingHint);
+  const classified =
+    normalizedCategoryHint != null
+      ? null
+      : await classifyProductCategory(base64Image, mimeType, ingredientText);
+  const effectiveCategoryHint = normalizedCategoryHint ?? toPromptCategory(classified!.category);
+  const useThinking = shouldEnableThinking(effectiveCategoryHint, thinkingHint);
 
   const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-  const cache = ENABLE_PROMPT_CACHE ? await getOrCreateCache(ai, "analysis") : null;
-  const fullPrompt = getAnalysisPrompt(normalizedCategoryHint);
-  const suffix = getPromptSuffix(ANALYSIS_SYSTEM_INSTRUCTION_BASE, fullPrompt);
+  const analysisCacheSlot =
+    effectiveCategoryHint === "supplement" ? "supplement" : "skincare";
+  const cache = ENABLE_PROMPT_CACHE
+    ? await getOrCreateCache(ai, "analysis", analysisCacheSlot)
+    : null;
+  const promptBase = getAnalysisPromptBaseConstant(effectiveCategoryHint);
+  const fullPrompt = getAnalysisPrompt(effectiveCategoryHint);
+  const suffix = getPromptSuffix(promptBase, fullPrompt);
   const normalizedIngredientText =
     typeof ingredientText === "string" ? ingredientText.trim() : "";
   const hasIngredientText = normalizedIngredientText.length >= 12;
   const normalizedUserQuestion =
     typeof userQuestion === "string" ? userQuestion.trim() : "";
   const hasUserQuestion = normalizedUserQuestion.length > 0;
+  const normalizedVerifiedDirective =
+    typeof verifiedIngredientDirective === "string"
+      ? verifiedIngredientDirective.trim()
+      : "";
+  const hasVerifiedDirective = normalizedVerifiedDirective.length > 0;
   // Cache ON: send only category suffix (system prompt lives in cachedContent).
   // Cache OFF: send full prompt so all rules remain effective.
   const promptForRequest = cache
@@ -1403,6 +1528,10 @@ export async function analyzeCosmeticImage(
       : "") +
     (hasUserQuestion
       ? "\n\nuserQuestion=" + JSON.stringify(normalizedUserQuestion)
+      : "") +
+    (hasVerifiedDirective
+      ? "\n\nVERIFIED_INGREDIENT_LIST_DIRECTIVE=" +
+        JSON.stringify(normalizedVerifiedDirective)
       : "");
 
   const response = await ai.models.generateContent({
@@ -1418,7 +1547,7 @@ export async function analyzeCosmeticImage(
     ],
     config: {
       ...DEFAULT_GENERATE_CONTENT_CONFIG,
-      responseJsonSchema: getAnalysisResponseSchema(normalizedCategoryHint),
+      responseJsonSchema: getAnalysisResponseSchema(effectiveCategoryHint),
       thinkingConfig: {
         thinkingBudget: useThinking ? 1400: 0,
         includeThoughts: useThinking,
@@ -1435,7 +1564,7 @@ export async function analyzeCosmeticImage(
         )
       : meta;
   console.log(
-    `\n[Thinking: ${useThinking ? "ON" : "OFF"} | categoryHint: ${categoryHint ?? "none"} | thinkingHint: ${thinkingHint ?? "none"} | ocrText: ${hasIngredientText ? "YES" : "NO"} | userQuestion: ${hasUserQuestion ? "YES" : "NO"}] Gemini usageMetadata:`,
+    `\n[Thinking: ${useThinking ? "ON" : "OFF"} | categoryHint: ${categoryHint ?? "none"} | effectiveCategory: ${effectiveCategoryHint} | classify: ${classified ? `${classified.category}/${classified.confidence}` : "skip"} | thinkingHint: ${thinkingHint ?? "none"} | ocrText: ${hasIngredientText ? "YES" : "NO"} | userQuestion: ${hasUserQuestion ? "YES" : "NO"} | verifiedDirective: ${hasVerifiedDirective ? "YES" : "NO"}] Gemini usageMetadata:`,
     JSON.stringify(plain ?? {}, null, 2)
   );
 
@@ -1462,6 +1591,9 @@ export async function analyzeCosmeticText(
   }
 
   const normalizedCategoryHint = normalizeCategoryHint(categoryHint);
+  if (!normalizedCategoryHint) {
+    throw new Error("CATEGORY_REQUIRED");
+  }
   const useThinking = shouldEnableThinking(categoryHint, thinkingHint);
   const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
   const prompt = getAnalysisPrompt(normalizedCategoryHint);

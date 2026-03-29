@@ -30,6 +30,7 @@ const BUTTON_SIZE = 200;
 const RIPPLE_COUNT = 3;
 const OCR_TARGET_SHORT_EDGE = 1600;
 const OCR_NO_RESIZE_SHORT_EDGE = 1200;
+// Keep high JPEG quality for OCR legibility; picker quality already set to 0.8.
 const OCR_JPEG_COMPRESS = 0.9;
 
 export default function HomeScreen() {

@@ -9,7 +9,8 @@
     "skipLibCheck": true
   },
   "include": [
-    "*.ts"
+    "*.ts",
+    "promptParts/**/*.ts"
   ],
   "extends": "expo/tsconfig.base"
 }

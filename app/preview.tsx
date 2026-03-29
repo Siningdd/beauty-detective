@@ -22,7 +22,14 @@ import {
   resolveHintDecision,
   detectCriticalBannedIngredient,
 } from "../services/ocrDetect";
+import { loadUserCorrectionMap } from "../services/userOcrCorrections";
+import { applyOcrCorrectionMapToText } from "../utils/ocrCorrectionApply";
 import { HighRiskModal } from "../components/HighRiskModal";
+import {
+  getLoadingPhaseMessage,
+  mapPhaseRatioToProgress,
+  type LoadingPhase,
+} from "../types/loadingPhase";
 import {
   BG,
   BUTTON_GRADIENT,
@@ -35,7 +42,6 @@ import {
 export default function PreviewScreen() {
   const router = useRouter();
   const controllerRef = useRef(new AbortController());
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const didNavigateRef = useRef(false);
   const [pending, setPending] = useState<{
     uri: string;
@@ -51,27 +57,21 @@ export default function PreviewScreen() {
   const [unknownOcrRawText, setUnknownOcrRawText] = useState<string | null>(null);
   const [highRiskVisible, setHighRiskVisible] = useState(false);
   const [highRiskIngredient, setHighRiskIngredient] = useState("");
+  const [previewLoadingPhase, setPreviewLoadingPhase] = useState<LoadingPhase>("compressing");
+  const [previewLoadingProgress, setPreviewLoadingProgress] = useState(0);
 
   useEffect(() => {
     setPending(getPendingImage());
   }, []);
 
-  const clearJumpTimer = () => {
-    if (!timerRef.current) return;
-    clearTimeout(timerRef.current);
-    timerRef.current = null;
-  };
-
   const jumpToReport = () => {
     if (didNavigateRef.current) return;
     didNavigateRef.current = true;
-    clearJumpTimer();
     router.replace("/report");
   };
 
   const handleBack = () => {
     controllerRef.current.abort();
-    clearJumpTimer();
     didNavigateRef.current = false;
     setUnknownIngredientText(null);
     setUnknownOcrRawText(null);
@@ -107,44 +107,42 @@ export default function PreviewScreen() {
     controllerRef.current.abort();
     controllerRef.current = new AbortController();
     const { signal } = controllerRef.current;
-    clearJumpTimer();
     didNavigateRef.current = false;
 
     setError(null);
     setLoading(true);
-    // Always hand off the minimal payload so report can continue immediately.
     setPendingImage({
       uri: pending.uri,
       base64: pending.base64,
       mimeType: pending.mimeType,
     });
-    setAnalysisParams({
-      base64: pending.base64,
-      mimeType: pending.mimeType,
-    });
-    timerRef.current = setTimeout(() => {
-      if (signal.aborted) return;
-      jumpToReport();
-    }, 1500);
     try {
       const detected = await detectOcrAndHints({
         uri: pending.uri,
         base64: pending.base64,
       });
-      const ingredientText = detected.correctedText || detected.rawOcrText;
+      const map = await loadUserCorrectionMap();
+      const rawLine = (detected.rawOcrText || "").trim();
+      const corrLine = (detected.correctedText || "").trim();
+      const mappedRaw = rawLine
+        ? applyOcrCorrectionMapToText(rawLine, map)
+        : "";
+      const mappedCorr = corrLine
+        ? applyOcrCorrectionMapToText(corrLine, map)
+        : "";
+      const ingredientText = mappedCorr || mappedRaw || "";
       const resolved = resolveHintDecision({
         confidenceHint: detected.confidenceHint,
         categoryHint: detected.categoryHint,
         thinkingHint: detected.thinkingHint,
       });
-      const ocrForSafety = `${detected.rawOcrText}\n${detected.correctedText}`;
+      const ocrForSafety = `${mappedRaw}\n${mappedCorr}`;
       const bannedHit = detectCriticalBannedIngredient(
         ocrForSafety,
         resolved?.categoryHint
       );
       if (bannedHit) {
         if (signal.aborted) return;
-        clearJumpTimer();
         didNavigateRef.current = false;
         setLoading(false);
         setHighRiskIngredient(bannedHit);
@@ -156,14 +154,17 @@ export default function PreviewScreen() {
         base64: pending.base64,
         mimeType: pending.mimeType,
         ingredientText,
-        ocrRawText: detected.rawOcrText,
+        ocrRawText: mappedRaw || undefined,
       });
       if (!resolved) {
-        if (signal.aborted || didNavigateRef.current) return;
-        clearJumpTimer();
-        setLoading(false);
-        setUnknownIngredientText(ingredientText || "");
-        setUnknownOcrRawText(detected.rawOcrText || "");
+        setAnalysisParams({
+          base64: pending.base64,
+          mimeType: pending.mimeType,
+          ingredientText,
+          ocrRawText: mappedRaw || undefined,
+        });
+        if (signal.aborted) return;
+        jumpToReport();
         return;
       }
       setAnalysisParams({
@@ -172,13 +173,12 @@ export default function PreviewScreen() {
         categoryHint: resolved.categoryHint,
         thinkingHint: resolved.thinkingHint,
         ingredientText,
-        ocrRawText: detected.rawOcrText,
+        ocrRawText: mappedRaw || undefined,
       });
       if (signal.aborted) return;
       jumpToReport();
     } catch (e) {
       if (e instanceof Error && e.name === "AbortError") return;
-      clearJumpTimer();
       didNavigateRef.current = false;
       setError(e instanceof Error ? e.message : "Analysis failed");
       setLoading(false);
@@ -188,9 +188,44 @@ export default function PreviewScreen() {
   useEffect(() => {
     return () => {
       controllerRef.current.abort();
-      clearJumpTimer();
     };
   }, []);
+
+  useEffect(() => {
+    if (!loading) {
+      setPreviewLoadingPhase("compressing");
+      setPreviewLoadingProgress(0);
+      return;
+    }
+    const startedAt = Date.now();
+    const timer = setInterval(() => {
+      const elapsed = Date.now() - startedAt;
+      if (elapsed < 300) {
+        setPreviewLoadingPhase("compressing");
+        setPreviewLoadingProgress(mapPhaseRatioToProgress("compressing", elapsed / 300));
+        return;
+      }
+      if (elapsed < 1200) {
+        setPreviewLoadingPhase("uploading");
+        setPreviewLoadingProgress(
+          mapPhaseRatioToProgress("uploading", (elapsed - 300) / 900)
+        );
+        return;
+      }
+      if (elapsed < 2200) {
+        setPreviewLoadingPhase("classifying");
+        setPreviewLoadingProgress(
+          mapPhaseRatioToProgress("classifying", (elapsed - 1200) / 1000)
+        );
+        return;
+      }
+      setPreviewLoadingPhase("processing");
+      setPreviewLoadingProgress(
+        mapPhaseRatioToProgress("processing", (elapsed - 2200) / 3200)
+      );
+    }, 120);
+    return () => clearInterval(timer);
+  }, [loading]);
 
   if (!pending) {
     return (
@@ -215,7 +250,20 @@ export default function PreviewScreen() {
           </Pressable>
           <View style={styles.uploadingCenter}>
             <ActivityIndicator size="large" color={TEXT_PRIMARY} />
-            <Text style={styles.uploadingLabel}>Uploading image</Text>
+            <Text style={styles.uploadingLabel}>
+              {getLoadingPhaseMessage(previewLoadingPhase)}
+            </Text>
+            <Text style={styles.uploadingPercent}>
+              {Math.round(previewLoadingProgress)}%
+            </Text>
+            <View style={styles.uploadingTrack}>
+              <View
+                style={[
+                  styles.uploadingFill,
+                  { width: `${Math.round(previewLoadingProgress)}%` },
+                ]}
+              />
+            </View>
           </View>
         </View>
       </View>
@@ -348,6 +396,24 @@ const styles = StyleSheet.create({
     color: TEXT_PRIMARY,
     fontSize: 16,
     fontWeight: "500",
+    textAlign: "center",
+  },
+  uploadingPercent: {
+    color: TEXT_MUTED,
+    fontSize: 13,
+  },
+  uploadingTrack: {
+    width: 220,
+    height: 6,
+    borderRadius: 999,
+    overflow: "hidden",
+    backgroundColor: "rgba(148, 163, 184, 0.24)",
+    borderWidth: 1,
+    borderColor: THEME_BORDER,
+  },
+  uploadingFill: {
+    height: "100%",
+    backgroundColor: TEXT_PRIMARY,
   },
   topBar: {
     flexDirection: "row",

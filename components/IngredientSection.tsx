@@ -10,7 +10,7 @@ import {
 import { Ionicons } from "@expo/vector-icons";
 import type { AnalysisIngredient, Category } from "../types/analysis";
 import { IngredientCard } from "./IngredientCard";
-import { TEXT_SECONDARY } from "../constants/theme";
+import { TEXT_SECONDARY, THEME } from "../constants/theme";
 
 export type IngredientGroup = { tag: string; items: AnalysisIngredient[] };
 
@@ -24,6 +24,10 @@ type IngredientSectionStyles = {
   ingredientGroupHeader: StyleProp<ViewStyle>;
   ingredientGroupTitle: StyleProp<TextStyle>;
   ingredientGroupContent: StyleProp<ViewStyle>;
+  ingredientRow?: StyleProp<ViewStyle>;
+  ingredientRowActions?: StyleProp<ViewStyle>;
+  addIngredientButton?: StyleProp<ViewStyle>;
+  addIngredientButtonText?: StyleProp<TextStyle>;
 };
 
 type Props = {
@@ -33,7 +37,21 @@ type Props = {
   onToggleGroup: (gi: number) => void;
   isSafetyScoreUnlocked: boolean;
   styles: IngredientSectionStyles;
+  editable?: boolean;
+  onEditIngredient?: (groupIndex: number, itemIndex: number) => void;
+  onDeleteIngredient?: (groupIndex: number, itemIndex: number) => void;
+  onPressAddMissing?: () => void;
 };
+
+function isLastInGroups(
+  groups: IngredientGroup[],
+  gi: number,
+  ii: number
+): boolean {
+  const lastG = groups.length - 1;
+  if (gi !== lastG) return false;
+  return ii === groups[lastG].items.length - 1;
+}
 
 function IngredientSectionInner({
   category,
@@ -42,6 +60,10 @@ function IngredientSectionInner({
   onToggleGroup,
   isSafetyScoreUnlocked,
   styles: sx,
+  editable = false,
+  onEditIngredient,
+  onDeleteIngredient,
+  onPressAddMissing,
 }: Props) {
   const hasIngredients = ingredientGroups.some((g) => g.items.length > 0);
   return (
@@ -82,20 +104,63 @@ function IngredientSectionInner({
                 {expanded && (
                   <View style={sx.ingredientGroupContent}>
                     {group.items.map((ing, ii) => (
-                      <IngredientCard
+                      <View
                         key={`${group.tag}-${ing.name}-${ii}`}
-                        name={ing.name}
-                        feature_tag={ing.feature_tag}
-                        description={ing.description}
-                        is_major={ing.is_major}
-                        safetyScore={ing.safetyScore}
-                        showSafetyScore={isSafetyScoreUnlocked}
-                        hideFeatureTagBadge
-                        isLast={
-                          gi === ingredientGroups.length - 1 &&
-                          ii === group.items.length - 1
-                        }
-                      />
+                        style={[
+                          { flexDirection: "row", alignItems: "flex-start", gap: 6 },
+                          sx.ingredientRow,
+                        ]}
+                      >
+                        <View style={{ flex: 1, minWidth: 0 }}>
+                          <IngredientCard
+                            name={ing.name}
+                            feature_tag={ing.feature_tag}
+                            description={ing.description}
+                            is_major={ing.is_major}
+                            safetyScore={ing.safetyScore}
+                            showSafetyScore={isSafetyScoreUnlocked}
+                            hideFeatureTagBadge
+                            isLast={
+                              !editable &&
+                              isLastInGroups(ingredientGroups, gi, ii)
+                            }
+                          />
+                        </View>
+                        {editable && onEditIngredient && onDeleteIngredient ? (
+                          <View
+                            style={[
+                              {
+                                flexDirection: "row",
+                                alignItems: "center",
+                                gap: 4,
+                                paddingTop: 10,
+                              },
+                              sx.ingredientRowActions,
+                            ]}
+                          >
+                            <Pressable
+                              onPress={() => onEditIngredient(gi, ii)}
+                              hitSlop={8}
+                            >
+                              <Ionicons
+                                name="pencil"
+                                size={20}
+                                color={THEME}
+                              />
+                            </Pressable>
+                            <Pressable
+                              onPress={() => onDeleteIngredient(gi, ii)}
+                              hitSlop={8}
+                            >
+                              <Ionicons
+                                name="trash-outline"
+                                size={20}
+                                color="#f87171"
+                              />
+                            </Pressable>
+                          </View>
+                        ) : null}
+                      </View>
                     ))}
                   </View>
                 )}
@@ -103,6 +168,28 @@ function IngredientSectionInner({
             );
           })
         )}
+        {editable && onPressAddMissing && hasIngredients ? (
+          <Pressable
+            onPress={onPressAddMissing}
+            style={[
+              {
+                marginTop: 14,
+                paddingVertical: 10,
+                alignItems: "center",
+              },
+              sx.addIngredientButton,
+            ]}
+          >
+            <Text
+              style={[
+                { color: THEME, fontSize: 15, fontWeight: "600" },
+                sx.addIngredientButtonText,
+              ]}
+            >
+              ➕ Add Missing Ingredient
+            </Text>
+          </Pressable>
+        ) : null}
       </View>
     </View>
   );

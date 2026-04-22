@@ -1,70 +1,212 @@
-# Beauty Detective - 化妆品成分识图分析 App
+Beauty Detective - Skin Logic AI Audit Engine
 
-AI 识图查询化妆品成分并生成分析报告的移动应用。
+The mission
 
-## 技术栈
+In an era of "Skin-fluencers" and complex marketing jargon, consumers are often misled by bold brand claims. Beauty Detective was created to democratize cosmetic chemistry. It is an AI-powered tool that translates dense, intimidating ingredient lists into plain language, specifically designed to help users verify if a product’s Marketing Claims actually match its Formula Reality.
 
-- **移动端**: Expo + React Native + TypeScript
-- **后端**: Node.js + Express
-- **AI**: Google Gemini API
 
-## 快速开始
 
-### 1. 申请 Gemini API Key
+Tech Stack
 
-在 [Google AI Studio](https://aistudio.google.com/apikey) 申请 API Key。
 
-### 2. 启动后端 API
 
-```bash
+
+
+Mobile: Expo + React Native + TypeScript
+
+
+
+BE: Node.js + Express
+
+
+
+AI & LLM: Google Gemini API + Cursor (AI-Native IDE)
+
+
+
+The Problems
+
+Based on qualitative insights, I synthesized the primary user frictions that this product aims to solve.
+
+Persona A - The Skeptical Shopper
+
+Focus: Anti-aging & Skincare Transparency
+
+
+
+
+
+The Local Barrier
+Struggling to decipher ingredient lists written in German or other foreign languages while shopping.
+
+
+
+Chemical Confusion 
+Seeing names like "Sodium Hyaluronate" but having no idea what they actually do for the skin.
+
+
+
+Potency Deception
+Suspecting "hero" ingredients are micro-dosed for marketing hype rather than real results.
+
+
+
+The "Worth-it" Verdict
+Lacking a professional, jargon-free audit to decide if a product is a waste of money.
+
+Persona B - The Overwhelmed Optimizer
+
+Focus: Supplements & Daily Wellness
+
+
+
+
+
+Mixing Anxiety
+Fear that combining different supplements will cancel out benefits or cause harm.
+
+
+
+The "Which Form?" Headache 
+Paralyzed by identical-looking options (like 10 types of Magnesium) with no way to choose.
+
+
+
+Conflict Uncertainty
+Constant worry about ingredient clashes (e.g., Zinc vs. Magnesium) and side effects.
+
+
+
+Guidance Gap 
+Taking 5+ daily pills without a smart consultant to optimize the routine.
+
+
+
+Solutions - A New Standard for Product Transparency
+
+1.Formula Verdict
+
+Applies the "1% Line" Industry Standard—the concentration threshold of preservatives—to audit whether "hero" ingredients are clinically active or micro-dosed for marketing. It provides a "Fair Price" estimate, ensuring users pay for potency, not hype.
+
+2.Safety Audit
+
+Maps ingredients against EU Regulatory Standards to visualize risk distribution. This replaces chemical anxiety with a clear safety score, providing total peace of mind for sensitive users.
+
+3.Actionable Insights
+
+Converts technical data into Instant Directives (e.g., Pregnancy Safety, UV-Warnings). It simplifies complex science into clear "do’s and don’ts" for safe, effective daily use.
+
+4.Versus Engine
+
+A Side-by-Side Comparison Suite that benchmarks competing products' actives and safety profiles. It eliminates choice paralysis by providing a data-backed "Winner" for every shopping dilemma.
+
+
+
+The MVP
+
+To maximize impact, I prioritized Single-Product Depth over broad comparison. I focused vertically on High-Stakes Skincare (Creams & Serums) because their high price points and complex actives demand the most rigorous consumer auditing.
+
+The Prioritization Logic
+
+
+
+
+
+Foundation First
+ Precise individual analysis is the prerequisite for accurate comparisons; I chose to perfect the "Single Audit" logic first.
+
+
+
+Engineering Velocity 
+Deferred cross-product comparison to avoid premature complexity in Data Sync and Local Storage.
+
+
+
+MVP Features
+
+
+
+Quick Start
+
+1. Get Gemini API Key
+
+Apply for an API Key at Google AI Studio.
+
+2. Launch Backend API
+
 cd api
-cp .env.example .env   # 编辑 .env 填入 GEMINI_API_KEY
+cp .env.example .env   # Edit .env and enter your GEMINI_API_KEY
 npm install
 npm run dev
-```
 
-API 默认运行在 http://localhost:3001
+The API runs by default at http://localhost:3001
 
-### 3. 启动移动端
+3. Launch Mobile App
 
-```bash
-npm install        # 根目录执行
-npx expo start --web    # 浏览器预览
-# 或
-npx expo start          # 真机 Expo Go 扫码
-```
+npm install             # Execute in the root directory
+npx expo start --web    # Preview in browser
+# OR
+npx expo start          # Scan with Expo Go on a physical device
 
-### 4. 修改 Prompt 与 JSON 结构
+4. Modify Prompts & JSON Structure
 
-编辑 `api/prompts.ts` 即可调整分析维度和返回格式。
+Edit api/prompts.ts to adjust analysis dimensions and response formats.
 
-### 5. API 地址配置
+5. API Configuration
 
-开发时默认请求 `http://localhost:3001`。若后端部署到其他地址，修改 `services/api.ts` 中的 `API_BASE`。
+The app defaults to http://localhost:3001 during development. If the backend is deployed elsewhere, update API_BASE in services/api.ts.
 
-## 项目结构
 
-```
+
+Project Structure
+
 beauty-detective/
-├── app/                 # Expo 路由（expo-router）
-│   ├── _layout.tsx  # 根布局
-│   ├── index.tsx    # 首页（Shazam 风格）
-│   ├── report.tsx  # 分析报告
-│   └── assets/      # 图标等资源
-├── services/            # API 调用
-├── types/               # 类型定义
-├── api/                 # 后端
-│   ├── prompts.ts       # Prompt + JSON 定义
-│   ├── analyze.ts       # Gemini 调用
-│   └── server.ts        # Express 服务
+├── app/                 # Expo Router
+│   ├── _layout.tsx      # Root Layout
+│   ├── index.tsx        # Homepage (Shazam-style)
+│   ├── report.tsx       # Analysis Report
+│   └── assets/          # Icons & Resources
+├── services/            # API Calls
+├── types/               # Type Definitions
+├── api/                 # Backend
+│   ├── prompts.ts       # Prompt + JSON Definitions
+│   ├── analyze.ts       # Gemini Integration
+│   └── server.ts        # Express Server
 ├── app.json
 ├── package.json
 └── README.md
-```
 
-## 环境变量
+Environment Variables
 
-| 变量 | 说明 |
-|------|------|
-| GEMINI_API_KEY | Google AI Studio API Key |
-| PORT | API 端口，默认 3001 |
+
+
+
+
+
+
+Variable
+
+
+
+Description
+
+
+
+
+
+GEMINI_API_KEY
+
+
+
+Google AI Studio API Key
+
+
+
+
+
+PORT
+
+
+
+API Port (Default: 3001)
+

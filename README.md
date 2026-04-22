@@ -69,8 +69,12 @@ Deferred cross-product comparison to avoid premature complexity in Data Sync and
 
 ## MVP Features
 
-<video src="https://github.com/Siningdd/beauty-detective/raw/main/demo_bd.mp4" controls width="100%">
-</video>
+
+https://github.com/user-attachments/assets/ed5f0f7d-56e0-4eab-9609-cbf16b3cb660
+
+
+
+
 
 ---
 

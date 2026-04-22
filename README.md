@@ -68,10 +68,7 @@ Deferred cross-product comparison to avoid premature complexity in Data Sync and
 ---
 
 ## MVP Features
-<video src="./demo_bd.mov" controls width="100%">
-  Your browser does not support the video tag. You can 
-  <a href="./demo_bd.mov">download the video here</a>.
-</video>
+[点击查看功能演示视频 (demo_bd.mov)](./demo_bd.mov)
 
 ---
 

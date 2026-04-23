@@ -1,5 +1,15 @@
 # Beauty Detective - Skin Logic AI Audit Engine
-
+## 📑 Table of Contents
+* [🎯 The Mission](#the-mission)
+* [🛠️ Tech Stack](#tech-stack)
+* [🔍 The Problems](#the-problems)
+* [💡 Solutions ](#solutions---a-new-standard-for-product-transparency)
+* [🚀 The MVP](#the-mvp)
+* [✅ MVP Features](#mvp-features)
+* [📱 Demo](#demo)
+* [⚙️ Quick Start](#quick-start)
+* [📂 Project Structure](#project-structure)
+* [🔑 Environment Variables](#environment-variables)
 ## The mission
 
 In an era of "Skin-fluencers" and complex marketing jargon, consumers are often misled by bold brand claims. Beauty Detective was created to democratize cosmetic chemistry. It is an AI-powered tool that translates dense, intimidating ingredient lists into plain language, specifically designed to help users verify if a product’s **Marketing Claims** actually match its **Formula Reality**.

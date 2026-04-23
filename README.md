@@ -69,7 +69,9 @@ Deferred cross-product comparison to avoid premature complexity in Data Sync and
 
 ## MVP Features
 
+<img width="933" height="521" alt="Image" src="https://github.com/user-attachments/assets/75c377c2-6608-4e0d-9ced-29f1cc92e481" />
 
+## Demo
 https://github.com/user-attachments/assets/ed5f0f7d-56e0-4eab-9609-cbf16b3cb660
 
 
